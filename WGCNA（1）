@@ -1,0 +1,254 @@
+##################################################################
+### WGCNA共表达网络分析流程（优化版）
+### 功能：基于表达相似性将基因聚类为模块，识别与行为相关的关键模块
+### 输入：DESeq2标准化矩阵 + 趋势分析筛选的基因 + 样本性状数据
+### 输出：基因模块、关键模块、枢纽基因、网络可视化
+##################################################################
+#### 0. 初始化与配置 --------------------------------------------------------
+cat("=== WGCNA共表达网络分析：初始化与配置 ===\n")
+
+### 0.2 记录分析元数据
+cat("正在记录分析元数据...\n")
+pipeline_metadata <- list(
+  analysis_timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+  brain_region = "[Brain_Region]",
+  analysis_stage = "WGCNA",
+  r_version = R.version.string,
+  deseq2_version = as.character(packageVersion("DESeq2")),
+  wgcna_version = as.character(packageVersion("WGCNA")),
+  input_files = c("DESeq2_Analysis_Object.rds", 
+                  "Trend_Analysis_Results/trend_analysis_results.rds",
+                  "Normalized_Counts_Matrix.csv")
+)
+saveRDS(pipeline_metadata, "WGCNA_analysis_metadata.rds")
+cat("✅ 分析元数据已保存: WGCNA_analysis_metadata.rds\n")
+
+### 0.3 加载必要的R包
+required_packages <- c("WGCNA", "DESeq2", "ggplot2", "dplyr", "dynamicTreeCut", 
+                       "flashClust", "RColorBrewer")
+invisible(lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    if (pkg == "WGCNA") {
+      BiocManager::install("WGCNA")
+    } else {
+      install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+  }
+}))
+cat("✅ 所有R包加载完成\n")
+
+### 0.4 配置分析环境
+cat("正在配置WGCNA分析环境...\n")
+allowWGCNAThreads()
+options(stringsAsFactors = FALSE)
+cat("✅ WGCNA环境配置完成，可用线程数:", WGCNA::allowWGCNAThreads(), "\n")
+
+#### 1. 数据加载与预处理 ----------------------------------------------------
+cat("\n=== 数据加载与预处理 ===\n")
+
+### 1.1 加载前期分析结果
+cat("正在加载前期分析结果...\n")
+if (file.exists("DESeq2_Analysis_Object.rds")) {
+  dds <- readRDS("DESeq2_Analysis_Object.rds")
+  sample_info <- as.data.frame(colData(dds))
+  cat("✅ DESeq2分析对象加载成功\n")
+  cat("   样本信息:", nrow(sample_info), "个样本,", ncol(sample_info), "个变量\n")
+} else {
+  stop("❌ 错误：未找到DESeq2分析对象")
+}
+if (file.exists("Trend_Analysis_Results/trend_analysis_results.rds")) {
+  trend_results <- readRDS("Trend_Analysis_Results/trend_analysis_results.rds")
+  cat("✅ 趋势分析结果加载成功\n")
+} else {
+  cat("⚠️ 警告：未找到趋势分析结果\n")
+  trend_results <- NULL
+}
+if (file.exists("Normalized_Counts_Matrix.csv")) {
+  normalized_counts <- read.csv("Normalized_Counts_Matrix.csv", row.names = 1)
+  cat("✅ 标准化计数矩阵加载成功\n")
+} else {
+  normalized_counts <- counts(dds, normalized = TRUE)
+  cat("✅ 从DESeq2对象生成标准化计数矩阵\n")
+}
+cat("   表达矩阵维度:", nrow(normalized_counts), "个基因,", ncol(normalized_counts), "个样本\n")
+
+### 1.2 优化基因选择策略
+gene_selection_strategy <- NULL
+trend_genes <- c()
+hvg_genes <- c()
+if (!is.null(trend_results)) {
+  trend_genes <- unique(c(trend_results$consistent_positive, 
+                          trend_results$consistent_negative))
+  trend_genes <- trend_genes[trend_genes %in% rownames(normalized_counts)]
+  cat("   可用的趋势分析基因:", length(trend_genes), "\n")
+}
+if (file.exists("[gene_lists].rds")) {
+  deseq2_advanced <- readRDS("[gene_lists].rds")
+  hvg_genes <- deseq2_advanced$wgcna_genes
+  hvg_genes <- hvg_genes[hvg_genes %in% rownames(normalized_counts)]
+  cat("   可用的高变异基因:", length(hvg_genes), "\n")
+}
+if (length(trend_genes) > 0 && length(hvg_genes) > 0) {
+  wgcna_genes <- unique(c(trend_genes, hvg_genes))
+  gene_selection_strategy <- "趋势基因+高变异基因(并集)"
+  cat("✅ 使用趋势基因和高变异基因的并集\n")
+  overlap_genes <- intersect(trend_genes, hvg_genes)
+  overlap_percent <- round(length(overlap_genes) / length(trend_genes) * 100, 1)
+  cat("   趋势基因与高变异基因重叠度:", overlap_percent, "%\n")
+} else if (length(trend_genes) > 100) {
+  wgcna_genes <- trend_genes
+  gene_selection_strategy <- "趋势分析基因"
+  cat("✅ 使用趋势分析基因 (数量充足)\n")
+} else if (length(hvg_genes) > 0) {
+  wgcna_genes <- hvg_genes
+  gene_selection_strategy <- "DESeq2高变异基因"
+  cat("✅ 使用DESeq2高变异基因\n")
+} else {
+  wgcna_genes <- rownames(normalized_counts)
+  gene_selection_strategy <- "所有基因"
+  cat("✅ 使用所有基因\n")
+}
+cat("   最终基因数量:", length(wgcna_genes), "（策略:", gene_selection_strategy, "）\n")
+cat("\n📊 基因集合质量评估:\n")
+cat("   总基因数:", length(wgcna_genes), "\n")
+cat("   占全基因组比例:", round(length(wgcna_genes) / nrow(normalized_counts) * 100, 1), "%\n")
+ideal_min <- 1000
+ideal_max <- 5000
+if (length(wgcna_genes) < ideal_min) {
+  cat("⚠️ 警告: 基因数量较少，可能影响模块识别\n")
+} else if (length(wgcna_genes) > ideal_max) {
+  cat("⚠️ 警告: 基因数量较多，计算量较大\n")
+} else {
+  cat("✅ 基因数量在理想范围内\n")
+}
+
+### 1.3 准备表达矩阵和性状数据
+cat("正在准备表达矩阵和性状数据...\n")
+expr_data <- normalized_counts[wgcna_genes, ]
+datExpr <- as.data.frame(t(expr_data))
+cat("✅ 表达矩阵准备完成\n")
+cat("   WGCNA输入维度:", nrow(datExpr), "个样本,", ncol(datExpr), "个基因\n")
+
+cat("正在准备性状数据...\n")
+if (!all(c("behavior_level", "behavior_score") %in% colnames(sample_info))) {
+  cat("⚠️ 样本信息缺少行为数据，正在创建...\n")
+  sample_info$behavior_level <- factor(
+    sample_info$species,
+    levels = c("[Genus_species_A]", "[Genus_species_C]", "[Genus_species_B]"),
+    labels = c("low", "medium", "high")
+  )
+  sample_info$behavior_score <- ifelse(
+    sample_info$species == "[Genus_species_B]", 1.0,
+    ifelse(sample_info$species == "[Genus_species_C]", 0.5, 0.0)
+  )
+}
+trait_data <- sample_info[, c("species", "behavior_level", "behavior_score"), drop = FALSE]
+trait_data$species_A <- as.numeric(trait_data$species == "[Genus_species_A]")
+trait_data$species_C <- as.numeric(trait_data$species == "[Genus_species_C]")
+trait_data$species_B <- as.numeric(trait_data$species == "[Genus_species_B]")
+trait_data$behavior_level_low <- as.numeric(trait_data$behavior_level == "low")
+trait_data$behavior_level_medium <- as.numeric(trait_data$behavior_level == "medium")
+trait_data$behavior_level_high <- as.numeric(trait_data$behavior_level == "high")
+trait_data_clean <- trait_data[, c("behavior_score", "species_A", "species_C", 
+                                   "species_B", "behavior_level_low", "behavior_level_medium", 
+                                   "behavior_level_high")]
+rownames(trait_data_clean) <- rownames(trait_data)
+cat("✅ 性状数据准备完成\n")
+cat("   性状变量:", paste(colnames(trait_data_clean), collapse = ", "), "\n")
+
+### 1.4 记录分析参数
+cat("正在记录分析参数...\n")
+wgcna_parameters <- list(
+  gene_selection_strategy = gene_selection_strategy,
+  final_gene_count = length(wgcna_genes),
+  sample_count = nrow(datExpr),
+  trait_variables = colnames(trait_data_clean),
+  analysis_timestamp = Sys.time()
+)
+saveRDS(wgcna_parameters, "WGCNA_analysis_parameters.rds")
+cat("✅ 分析参数已保存: WGCNA_analysis_parameters.rds\n")
+
+#### 2. 数据质控与网络参数优化 ----------------------------------------------
+cat("\n=== 数据质控与网络参数优化 ===\n")
+
+### 2.1 样本质量检查
+cat("正在进行样本质量检查...\n")
+sample_dist <- dist(datExpr)
+sampleTree <- hclust(sample_dist, method = "average")
+dist_values <- as.vector(sample_dist)
+threshold <- mean(dist_values) + 2 * sd(dist_values)
+cat("   样本间距离统计:\n")
+cat("   距离均值:", round(mean(dist_values), 3), "\n")
+cat("   距离标准差:", round(sd(dist_values), 3), "\n")
+cat("   异常样本阈值:", round(threshold, 3), "\n")
+if (!dir.exists("WGCNA_Visualizations")) {
+  dir.create("WGCNA_Visualizations", recursive = TRUE)
+}
+png("WGCNA_Visualizations/sample_clustering_tree.png", width = 1200, height = 900, res = 150)
+par(mar = c(10, 4, 4, 2) + 0.1)
+plot(sampleTree, main = "Sample Clustering Tree", 
+     xlab = "", ylab = "Height", 
+     sub = "", cex = 0.8, hang = -1)
+height_threshold <- quantile(sampleTree$height, 0.95)
+abline(h = height_threshold, col = "red", lty = 2, lwd = 2)
+outlier_samples <- sampleTree$labels[sampleTree$height > height_threshold]
+if (length(outlier_samples) > 0) {
+  outlier_indices <- which(sampleTree$labels %in% outlier_samples)
+  points(outlier_indices, sampleTree$height[outlier_indices], 
+         col = "red", pch = 19, cex = 1.2)
+}
+legend(x = "bottomright", legend = c("Tree", "Threshold", "Outlier"),
+       col = c("black", "red", "red"), lty = c(1, 2, NA), pch = c(NA, NA, 19),
+       lwd = c(1, 2, NA), cex = 0.75, bg = "white", inset = c(0.02, 0.05))
+mtext("Sample Names", side = 1, line = 8, cex = 0.9)
+dev.off()
+cat("✅ 样本聚类图已保存\n")
+
+### 2.2 软阈值功率选择
+cat("正在选择软阈值功率...\n")
+powers <- c(1:10, seq(12, 20, 2))
+sft <- pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+par(mfrow = c(1, 2))
+cex1 <- 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     xlab = "Soft Threshold Power", ylab = "Scale-Free Topology Model Fit (R²)",
+     type = "n", main = "Scale-Free Topology Fit")
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3]) * sft$fitIndices[,2],
+     labels = powers, cex = cex1, col = "red")
+abline(h = 0.85, col = "blue", lty = 2)
+abline(h = 0.90, col = "red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab = "Soft Threshold Power", ylab = "Mean Connectivity",
+     type = "n", main = "Mean Connectivity")
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels = powers, cex = cex1, col = "red")
+softPower <- sft$powerEstimate
+if (is.na(softPower)) {
+  viable_powers <- which(sft$fitIndices[,2] > 0.85)
+  if (length(viable_powers) > 0) {
+    softPower <- sft$fitIndices[min(viable_powers), 1]
+    cat("✅ 基于R² > 0.85选择功率:", softPower, "\n")
+  } else {
+    best_r2_idx <- which.max(sft$fitIndices[,2])
+    softPower <- sft$fitIndices[best_r2_idx, 1]
+    cat("⚠️ 使用R²最高的功率:", softPower, "\n")
+  }
+} else {
+  cat("✅ 自动选择软阈值功率:", softPower, "\n")
+}
+cat("\n📊 软阈值检查:\n")
+cat("   最终使用的软阈值功率:", softPower, "\n")
+cat("   无尺度拓扑拟合指数 R²:", sft$fitIndices[sft$fitIndices[,1] == softPower, 2], "\n")
+cat("   平均连接度:", sft$fitIndices[sft$fitIndices[,1] == softPower, 5], "\n")
+wgcna_parameters$soft_power <- softPower
+wgcna_parameters$scale_free_r2 <- sft$fitIndices[sft$fitIndices[,1] == softPower, 2]
+saveRDS(wgcna_parameters, "WGCNA_analysis_parameters.rds")
+
+#### 3. 网络构建与模块识别 --------------------------------------------------
+cat("\n=== 网络构建与模块识别 ===\n")
+
+### 3.1 一步法网络构建
+cat("正在构建共表达网络并识别基因模块...\n")
+parameter_sets <- list(
+  list(minModuleSize = 30, deepSplit = 2, mergeCutHeight = 0.25, desc = "Medium"),
+ 
