@@ -1,0 +1,311 @@
+##############################################d####################
+### 趋势分析流程（精简版：仅有序比较）
+### 功能：基于DESeq2预处理结果，分析基因表达在行为等级上的变化
+### 输入：DESeq2分析生成的RDS文件和标准化矩阵
+### 输出：有序比较结果、前50差异基因热图
+##################################################################
+
+#### 0. 初始化与配置 --------------------------------------------------------
+cat("=== 趋势分析（有序比较精简版）：初始化与配置 ===\n")
+
+create_analysis_dirs <- function() {
+  dirs <- c("Trend_Visualizations", "Trend_Analysis_Results")
+  for(dir in dirs) {
+    if(!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+  }
+}
+create_analysis_dirs()
+
+### 0.2 检查必要文件是否存在
+cat("正在检查必要文件...\n")
+required_files <- c("DESeq2_Analysis_Object.rds", "Normalized_Counts_Matrix.csv")
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0) {
+  stop("❌ 缺少必要输入文件: ", paste(missing_files, collapse = ", "))
+}
+cat("✅ 所有必要文件都存在\n")
+
+### 0.3 记录分析元数据
+cat("正在记录分析元数据...\n")
+pipeline_metadata <- list(
+  analysis_timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+  brain_region = "[Brain_Region]",
+  analysis_stage = "Trend_Analysis_Ordered_Only",
+  r_version = R.version.string,
+  deseq2_version = as.character(packageVersion("DESeq2")),
+  input_files = required_files
+)
+saveRDS(pipeline_metadata, "Trend_analysis_metadata.rds")
+cat("✅ 分析元数据已保存: Trend_analysis_metadata.rds\n")
+
+### 0.4 加载必要的R包
+required_packages <- c("DESeq2", "ggplot2", "pheatmap", "RColorBrewer", "dplyr")
+invisible(lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}))
+cat("✅ 所有R包加载完成\n")
+
+### 0.4.1 定义物种行为映射
+BEHAVIOR_LEVELS <- c(
+  "[Species_A]" = "low",      
+  "[Species_C]" = "medium",  
+  "[Species_B]" = "high"      
+)
+
+BEHAVIOR_SCORES <- c(
+  "[Species_A]" = 0.0,        
+  "[Species_C]" = 0.5, 
+  "[Species_B]" = 1.0         
+)
+cat("✅ 行为映射定义完成\n")
+
+### 0.5 加载输入数据
+cat("正在加载输入数据...\n")
+dds <- readRDS("DESeq2_Analysis_Object.rds")
+normalized_counts <- read.csv("Normalized_Counts_Matrix.csv", row.names = 1)
+cat("✅ 输入数据加载完成\n")
+cat("   DESeq2对象样本数:", ncol(dds), "\n")
+cat("   标准化矩阵维度:", nrow(normalized_counts), "基因 ×", ncol(normalized_counts), "样本\n")
+
+### 0.6 准备趋势分析输入数据
+cat("正在准备趋势分析输入数据...\n")
+gene_selection_strategy <- ""
+trend_analysis_genes <- c()
+
+if (file.exists("[gene_lists].rds")) {
+  gene_selection_strategy <- "DESeq2高变异基因"
+  deseq2_advanced <- readRDS("[gene_lists].rds")
+  if (!is.null(deseq2_advanced$all_significant_hvg) && length(deseq2_advanced$all_significant_hvg) > 0) {
+    trend_analysis_genes <- deseq2_advanced$all_significant_hvg
+    cat("✅ 使用DESeq2的显著高变异基因列表\n")
+  }
+} 
+if (length(trend_analysis_genes) == 0 && file.exists("[hvg_lists].rds")) {
+  gene_selection_strategy <- "高变异基因列表"
+  hvg_lists <- readRDS("[hvg_lists].rds")
+  if (!is.null(hvg_lists$wgcna_genes) && length(hvg_lists$wgcna_genes) > 0) {
+    trend_analysis_genes <- hvg_lists$wgcna_genes
+    cat("✅ 使用WGCNA基因列表（前5000高变异基因）\n")
+  } else if (!is.null(hvg_lists$all_significant_hvg) && length(hvg_lists$all_significant_hvg) > 0) {
+    trend_analysis_genes <- hvg_lists$all_significant_hvg
+    cat("✅ 使用显著高变异基因列表\n")
+  }
+}
+if (length(trend_analysis_genes) == 0 && file.exists("Network_Analysis/High_Variable_Genes_Expression.csv")) {
+  gene_selection_strategy <- "网络分析高变异基因"
+  hvg_expression <- read.csv("Network_Analysis/High_Variable_Genes_Expression.csv", row.names = 1)
+  trend_analysis_genes <- rownames(hvg_expression)
+  cat("✅ 使用网络分析的高变异基因\n")
+}
+if (length(trend_analysis_genes) == 0) {
+  gene_selection_strategy <- "随机基因子集"
+  all_genes <- rownames(normalized_counts)
+  set.seed(123)
+  if (length(all_genes) > 5000) {
+    trend_analysis_genes <- sample(all_genes, 5000)
+    cat("✅ 随机选择5000个基因进行趋势分析\n")
+  } else {
+    trend_analysis_genes <- all_genes
+    cat("✅ 使用所有基因进行趋势分析\n")
+  }
+}
+trend_analysis_genes <- trend_analysis_genes[trend_analysis_genes %in% rownames(normalized_counts)]
+cat("   最终基因数量:", length(trend_analysis_genes), "（策略:", gene_selection_strategy, "）\n")
+
+if (length(trend_analysis_genes) == 0) {
+  cat("⚠️ 警告：基因列表为空，使用方差最高的500个基因\n")
+  gene_variance <- apply(normalized_counts, 1, var)
+  top_variance_genes <- names(sort(gene_variance, decreasing = TRUE))[1:500]
+  trend_analysis_genes <- top_variance_genes
+  gene_selection_strategy <- "高方差基因"
+  cat("   备用方案基因数量:", length(trend_analysis_genes), "\n")
+}
+
+expr_data <- normalized_counts[trend_analysis_genes, ]
+cat("✅ 趋势分析表达矩阵准备完成\n")
+cat("   最终矩阵维度:", nrow(expr_data), "个基因,", ncol(expr_data), "个样本\n")
+
+### 0.7 记录分析参数
+trend_analysis_parameters <- list(
+  gene_selection_strategy = gene_selection_strategy,
+  final_gene_count = length(trend_analysis_genes),
+  behavior_gradient = BEHAVIOR_SCORES,
+  method_used = "ordered_comparison"
+)
+saveRDS(trend_analysis_parameters, "Trend_analysis_parameters.rds")
+cat("✅ 分析参数已保存: Trend_analysis_parameters.rds\n")
+
+#### 1. 有序比较核心分析 ----------------------------------------------------
+### 1.1 准备样本信息
+sample_info <- as.data.frame(colData(dds))
+sample_info$behavior_level <- factor(
+  BEHAVIOR_LEVELS[sample_info$species],
+  levels = c("low", "medium", "high")
+)
+sample_info$behavior_score <- BEHAVIOR_SCORES[sample_info$species]
+cat("   行为等级分布:\n")
+cat("   Low ([Species_A]):", sum(sample_info$behavior_level == "low"), "samples\n")
+cat("   Medium ([Species_C]):", sum(sample_info$behavior_level == "medium"), "samples\n")
+cat("   High ([Species_B]):", sum(sample_info$behavior_level == "high"), "samples\n")
+
+### 1.2 有序比较分析
+dds_ordered <- DESeqDataSetFromMatrix(
+  countData = counts(dds),
+  colData = sample_info,
+  design = ~ behavior_level
+)
+dds_ordered <- DESeq(dds_ordered)
+results_trend <- results(dds_ordered, 
+                         contrast = list("behavior_level_high_vs_low",
+                                         "behavior_level_medium_vs_low"))
+cat("✅ 有序比较分析完成，检验基因数:", nrow(results_trend), "\n")
+cat("   显著趋势基因(padj < 0.05):", sum(results_trend$padj < 0.05, na.rm = TRUE), "\n")
+
+ordered_results_df <- as.data.frame(results_trend)
+ordered_results_df$gene_id <- rownames(ordered_results_df)
+ordered_results_df$trend_type <- ifelse(
+  ordered_results_df$padj < 0.05 & !is.na(ordered_results_df$padj),
+  ifelse(ordered_results_df$log2FoldChange > 0, "positive_trend", "negative_trend"),
+  "no_trend"
+)
+
+cat("【有序比较结果统计】\n")
+cat("   正趋势基因:", sum(ordered_results_df$trend_type == "positive_trend", na.rm = TRUE), "\n")
+cat("   负趋势基因:", sum(ordered_results_df$trend_type == "negative_trend", na.rm = TRUE), "\n")
+cat("   无趋势基因:", sum(ordered_results_df$trend_type == "no_trend", na.rm = TRUE), "\n")
+
+#### 2. 结果可视化：前50差异基因热图 ----------------------------------------
+### 2.1 准备VST转换数据
+vsd <- vst(dds_ordered, blind = FALSE)
+expr_matrix <- assay(vsd)
+hoarding_order <- order(sample_info$behavior_score)
+expr_ordered <- expr_matrix[, hoarding_order]
+
+### 2.2 提取前50显著基因
+sig_ordered <- ordered_results_df[!is.na(ordered_results_df$padj) & ordered_results_df$padj < 0.05, ]
+if (nrow(sig_ordered) > 0) {
+  sig_ordered <- sig_ordered[order(sig_ordered$padj), ]
+  heatmap_genes <- sig_ordered$gene_id[1:min(50, nrow(sig_ordered))]
+  cat("   选择前", length(heatmap_genes), "个最显著的有序比较基因进行热图展示\n")
+  available_genes <- heatmap_genes[heatmap_genes %in% rownames(vsd)]
+  if (length(available_genes) == 0) {
+    cat("⚠️ 错误：在VST数据中未找到指定的基因\n")
+  } else {
+    if (length(available_genes) < length(heatmap_genes)) {
+      cat("⚠️ 警告：", length(heatmap_genes) - length(available_genes), 
+          "个基因在VST数据中不存在\n")
+    }
+    vsd_sig <- vsd[available_genes, ]
+    expr_heatmap <- assay(vsd_sig)[, hoarding_order]
+    annotation_df <- data.frame(
+      Behavior_Score = sample_info$behavior_score[hoarding_order],
+      Species = factor(sample_info$species[hoarding_order])
+    )
+    rownames(annotation_df) <- colnames(expr_heatmap)
+    if (!exists("SPECIES_COLORS")) {
+      cat("⚠️ SPECIES_COLORS未定义，使用默认颜色\n")
+      SPECIES_COLORS <- c(
+        "[Genus_species_C]" = "#F0A73A",
+        "[Genus_species_A]" = "#3ABF99",  
+        "[Genus_species_B]" = "#2C91E0"
+      )
+    }
+    annotation_colors <- list(
+      Species = SPECIES_COLORS,
+      Behavior_Score = colorRampPalette(c("#F7FBFF", "#08306B"))(50)
+    )
+    actual_species <- levels(annotation_df$Species)
+    species_colors_to_use <- SPECIES_COLORS[actual_species]
+    species_colors_to_use <- species_colors_to_use[!sapply(species_colors_to_use, is.null)]
+    if (length(species_colors_to_use) > 0) {
+      annotation_colors$Species <- species_colors_to_use
+    } else {
+      cat("⚠️ 警告：物种颜色匹配失败，使用默认颜色\n")
+    }
+    tryCatch({
+      pheatmap(expr_heatmap,
+               scale = "row",
+               cluster_cols = FALSE,
+               cluster_rows = TRUE,
+               annotation_col = annotation_df,
+               annotation_colors = annotation_colors,
+               show_rownames = min(20, nrow(expr_heatmap)),
+               main = paste0("Top Significant Ordered Comparison Genes\n(n=", nrow(expr_heatmap), " genes)"),
+               color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100),
+               fontsize_row = 8,
+               fontsize_col = 8,
+               fontsize = 10,
+               filename = "Trend_Visualizations/ordered_comparison_top50_heatmap.png",
+               width = 10, 
+               height = max(6, nrow(expr_heatmap) * 0.15),
+               silent = FALSE)
+      cat("✅ 热图已保存: Trend_Visualizations/ordered_comparison_top50_heatmap.png\n")
+      pheatmap(expr_heatmap,
+               scale = "row",
+               cluster_cols = FALSE,
+               cluster_rows = TRUE,
+               annotation_col = annotation_df,
+               annotation_colors = annotation_colors,
+               show_rownames = min(20, nrow(expr_heatmap)),
+               main = paste0("Top Significant Ordered Comparison Genes\n(n=", nrow(expr_heatmap), " genes)"),
+               color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100),
+               fontsize_row = 8,
+               fontsize_col = 8,
+               fontsize = 10,
+               filename = "Trend_Visualizations/ordered_comparison_top50_heatmap.pdf",
+               width = 10, 
+               height = max(6, nrow(expr_heatmap) * 0.15))
+      cat("✅ 热图PDF版本已保存\n")
+    }, error = function(e) {
+      cat("❌ 热图绘制失败:", e$message, "\n")
+    })
+  }
+} else {
+  cat("⚠️ 未发现显著有序比较基因，跳过热图绘制\n")
+}
+
+#### 3. 结果保存 ------------------------------------------------------------
+cat("正在保存分析结果...\n")
+if (!dir.exists("Trend_Analysis_Results")) {
+  dir.create("Trend_Analysis_Results", recursive = TRUE)
+}
+write.csv(ordered_results_df, 
+          "Trend_Analysis_Results/ordered_comparison_full_results.csv", 
+          row.names = FALSE)
+sig_genes_all <- ordered_results_df$gene_id[ordered_results_df$trend_type != "no_trend"]
+write.csv(data.frame(GeneID = sig_genes_all, 
+                     Trend_Type = ordered_results_df$trend_type[ordered_results_df$trend_type != "no_trend"],
+                     log2FoldChange = ordered_results_df$log2FoldChange[ordered_results_df$trend_type != "no_trend"],
+                     padj = ordered_results_df$padj[ordered_results_df$trend_type != "no_trend"]),
+          "Trend_Analysis_Results/ordered_significant_genes_info.csv", 
+          row.names = FALSE)
+write.csv(data.frame(GeneID = ordered_results_df$gene_id[ordered_results_df$trend_type == "positive_trend"]),
+          "Trend_Analysis_Results/ordered_positive_trend_genes.csv", 
+          row.names = FALSE)
+write.csv(data.frame(GeneID = ordered_results_df$gene_id[ordered_results_df$trend_type == "negative_trend"]),
+          "Trend_Analysis_Results/ordered_negative_trend_genes.csv", 
+          row.names = FALSE)
+if (exists("available_genes") && length(available_genes) > 0) {
+  write.csv(data.frame(GeneID = available_genes,
+                       Rank = seq_along(available_genes)),
+            "Trend_Analysis_Results/heatmap_top_genes_list.csv",
+            row.names = FALSE)
+}
+ordered_results <- list(
+  ordered_results = ordered_results_df,
+  parameters = trend_analysis_parameters,
+  metadata = pipeline_metadata
+)
+saveRDS(ordered_results, "Trend_Analysis_Results/ordered_analysis_results.rds")
+cat("✅ 所有分析结果已保存至 Trend_Analysis_Results/ 目录\n")
+cat("\n📁 输出文件清单:\n")
+cat("   - ordered_comparison_full_results.csv\n")
+cat("   - ordered_significant_genes_info.csv\n")
+cat("   - ordered_positive_trend_genes.csv\n")
+cat("   - ordered_negative_trend_genes.csv\n")
+cat("   - heatmap_top_genes_list.csv\n")
+cat("   - ordered_analysis_results.rds\n")
+cat("   - ordered_comparison_top50_heatmap.png/pdf\n")
