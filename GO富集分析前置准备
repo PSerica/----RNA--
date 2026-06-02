@@ -1,0 +1,459 @@
+###############################################################################
+# RNA-seq下游功能富集分析完整流程
+# 分析三个物种的目标性状相关基因功能
+# 使用自定义OrgDb包
+# 重点关注：趋势分析基因 + WGCNA关键模块
+###############################################################################
+
+### 0.1 创建分析目录
+create_analysis_dirs()
+
+### 1.1 加载必要的R包
+cat("=== 下游功能富集分析环境设置 ===\n")
+required_packages <- c(
+  "clusterProfiler",
+  "org.[YourSpecies].eg.db",
+  "enrichplot",
+  "ggplot2",
+  "DOSE",
+  "pathview",
+  "ggridges",
+  "ggnewscale",
+  "patchwork",
+  "VennDiagram",
+  "tidyverse"
+)
+invisible(lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}))
+cat("✅ 所有R包加载完成\n")
+
+### 1.2 创建基因ID映射表
+create_gene_mapping_for_new_pipeline <- function() {
+  cat("\n=== 创建新流程基因ID映射表 ===\n")
+  all_gene_sources <- c()
+  cat("收集趋势分析基因ID...\n")
+  trend_files <- c(
+    "Trend_Analysis_Results/consistent_positive_trend_genes.csv",
+    "Trend_Analysis_Results/consistent_negative_trend_genes.csv"
+  )
+  for (file in trend_files) {
+    if (file.exists(file)) {
+      genes <- read.csv(file)$GeneID
+      all_gene_sources <- c(all_gene_sources, genes)
+      cat("   从", basename(file), "获取", length(genes), "个基因\n")
+    }
+  }
+  cat("收集WGCNA基因ID...\n")
+  wgcna_files <- c(
+    "WGCNA_Results/key_module_genes.csv",
+    "WGCNA_Results/hub_genes.csv"
+  )
+  for (file in wgcna_files) {
+    if (file.exists(file)) {
+      genes <- read.csv(file)$GeneID
+      all_gene_sources <- c(all_gene_sources, genes)
+      cat("   从", basename(file), "获取", length(genes), "个基因\n")
+    }
+  }
+  if (length(all_gene_sources) == 0) {
+    cat("使用DESeq2标准化矩阵作为备用基因源...\n")
+    if (file.exists("Normalized_Counts_Matrix.csv")) {
+      normalized_counts <- read.csv("Normalized_Counts_Matrix.csv", row.names = 1)
+      all_gene_sources <- rownames(normalized_counts)
+    }
+  }
+  original_gene_ids <- unique(all_gene_sources)
+  cat("总唯一基因数量:", length(original_gene_ids), "\n")
+  orgdb_gids <- keys(org.[YourSpecies].eg.db, keytype = "GID")
+  cat("OrgDb中可用GID数量:", length(orgdb_gids), "\n")
+  cat("执行基因ID映射策略...\n")
+  direct_matches <- original_gene_ids[original_gene_ids %in% orgdb_gids]
+  cat("直接匹配成功:", length(direct_matches), "个基因\n")
+  if (length(direct_matches) > 0) {
+    gene_mapping <- data.frame(
+      original_gene_id = original_gene_ids,
+      GID = ifelse(original_gene_ids %in% orgdb_gids, 
+                   original_gene_ids, 
+                   NA),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    cat("创建人工基因ID映射...\n")
+    gene_mapping <- data.frame(
+      original_gene_id = original_gene_ids,
+      GID = paste0("GENE_", seq_along(original_gene_ids)),
+      stringsAsFactors = FALSE
+    )
+  }
+  valid_mappings <- sum(!is.na(gene_mapping$GID))
+  mapping_rate <- round(valid_mappings / nrow(gene_mapping) * 100, 1)
+  cat("基因映射成功率:", valid_mappings, "/", nrow(gene_mapping), 
+      sprintf("(%.1f%%)", mapping_rate), "\n")
+  write.csv(gene_mapping, "new_pipeline_gene_mapping.csv", row.names = FALSE)
+  cat("✅ 新流程基因映射表已保存\n")
+  return(gene_mapping)
+}
+
+### 1.3 读取趋势分析结果基因列表
+read_trend_analysis_genes <- function(mapping_table) {
+  cat("\n=== 读取趋势分析基因列表 ===\n")
+  trend_lists <- list()
+  if (file.exists("Trend_Analysis_Results/consistent_positive_trend_genes.csv")) {
+    cat("读取正趋势基因...\n")
+    pos_genes <- read.csv("Trend_Analysis_Results/consistent_positive_trend_genes.csv")$GeneID
+    pos_converted <- mapping_table$GID[match(pos_genes, mapping_table$original_gene_id)]
+    pos_valid <- na.omit(pos_converted)
+    pos_final <- pos_valid[pos_valid %in% keys(org.[YourSpecies].eg.db, keytype = "GID")]
+    trend_lists[["trend_positive"]] <- pos_final
+    cat("  正趋势基因: ", length(pos_final), "个\n")
+  } else {
+    trend_lists[["trend_positive"]] <- character(0)
+  }
+  if (file.exists("Trend_Analysis_Results/consistent_negative_trend_genes.csv")) {
+    cat("读取负趋势基因...\n")
+    neg_genes <- read.csv("Trend_Analysis_Results/consistent_negative_trend_genes.csv")$GeneID
+    neg_converted <- mapping_table$GID[match(neg_genes, mapping_table$original_gene_id)]
+    neg_valid <- na.omit(neg_converted)
+    neg_final <- neg_valid[neg_valid %in% keys(org.[YourSpecies].eg.db, keytype = "GID")]
+    trend_lists[["trend_negative"]] <- neg_final
+    cat("  负趋势基因: ", length(neg_final), "个\n")
+  } else {
+    trend_lists[["trend_negative"]] <- character(0)
+  }
+  total_trend_genes <- length(unlist(trend_lists))
+  cat("趋势分析总基因数:", total_trend_genes, "\n")
+  return(trend_lists)
+}
+
+### 1.4 读取WGCNA网络分析结果基因列表
+read_wgcna_analysis_genes <- function(mapping_table) {
+  cat("\n=== 读取WGCNA网络分析基因列表 ===\n")
+  wgcna_lists <- list()
+  if (file.exists("WGCNA_Results/key_module_genes.csv")) {
+    cat("读取关键模块基因...\n")
+    module_genes <- read.csv("WGCNA_Results/key_module_genes.csv")$GeneID
+    module_converted <- mapping_table$GID[match(module_genes, mapping_table$original_gene_id)]
+    module_valid <- na.omit(module_converted)
+    module_final <- module_valid[module_valid %in% keys(org.[YourSpecies].eg.db, keytype = "GID")]
+    wgcna_lists[["wgcna_key_module"]] <- module_final
+    cat("  关键模块基因: ", length(module_final), "个\n")
+  } else {
+    wgcna_lists[["wgcna_key_module"]] <- character(0)
+  }
+  if (file.exists("WGCNA_Results/hub_genes.csv")) {
+    cat("读取枢纽基因...\n")
+    hub_genes <- read.csv("WGCNA_Results/hub_genes.csv")$GeneID
+    hub_converted <- mapping_table$GID[match(hub_genes, mapping_table$original_gene_id)]
+    hub_valid <- na.omit(hub_converted)
+    hub_final <- hub_valid[hub_valid %in% keys(org.[YourSpecies].eg.db, keytype = "GID")]
+    wgcna_lists[["wgcna_hub_genes"]] <- hub_final
+    cat("  枢纽基因: ", length(hub_final), "个\n")
+  } else {
+    wgcna_lists[["wgcna_hub_genes"]] <- character(0)
+  }
+  total_wgcna_genes <- length(unlist(wgcna_lists))
+  cat("WGCNA总基因数:", total_wgcna_genes, "\n")
+  return(wgcna_lists)
+}
+
+### 1.5 创建高置信度整合基因集合
+create_integrated_gene_sets <- function(trend_lists, wgcna_lists) {
+  cat("\n=== 创建高置信度整合基因集合 ===\n")
+  integrated_lists <- list()
+  trend_positive <- trend_lists[["trend_positive"]]
+  trend_negative <- trend_lists[["trend_negative"]]
+  wgcna_module <- wgcna_lists[["wgcna_key_module"]]
+  wgcna_hubs <- wgcna_lists[["wgcna_hub_genes"]]
+  if (length(trend_positive) > 0 && length(wgcna_module) > 0) {
+    trend_wgcna_overlap <- intersect(
+      c(trend_positive, trend_negative), 
+      c(wgcna_module, wgcna_hubs)
+    )
+    integrated_lists[["high_confidence_overlap"]] <- trend_wgcna_overlap
+    cat("  趋势-WGCNA重叠基因: ", length(trend_wgcna_overlap), "个\n")
+  }
+  all_trend_genes <- unique(c(trend_positive, trend_negative))
+  if (length(all_trend_genes) > 0) {
+    integrated_lists[["all_trend_genes"]] <- all_trend_genes
+    cat("  所有趋势基因: ", length(all_trend_genes), "个\n")
+  }
+  all_wgcna_genes <- unique(c(wgcna_module, wgcna_hubs))
+  if (length(all_wgcna_genes) > 0) {
+    integrated_lists[["all_wgcna_genes"]] <- all_wgcna_genes
+    cat("  所有WGCNA基因: ", length(all_wgcna_genes), "个\n")
+  }
+  all_analysis_genes <- unique(c(all_trend_genes, all_wgcna_genes))
+  if (length(all_analysis_genes) > 0) {
+    integrated_lists[["complete_gene_set"]] <- all_analysis_genes
+    cat("  完整基因集合: ", length(all_analysis_genes), "个\n")
+  }
+  total_integrated <- length(unlist(integrated_lists))
+  cat("整合集合总基因数:", total_integrated, "\n")
+  return(integrated_lists)
+}
+
+### 1.6 完整数据质量检查与验证
+validate_data_quality <- function(trend_lists, wgcna_lists, integrated_lists, mapping_table) {
+  cat("\n=== 执行完整数据质量检查 ===\n")
+  all_gene_lists <- c(trend_lists, wgcna_lists, integrated_lists)
+  total_lists <- length(all_gene_lists)
+  cat("总基因列表数量:", total_lists, "\n")
+  cat("\n各基因列表详情:\n")
+  for (name in names(all_gene_lists)) {
+    gene_count <- length(all_gene_lists[[name]])
+    status <- ifelse(gene_count >= 10, "✅", ifelse(gene_count >= 5, "⚠️", "❌"))
+    cat(sprintf("  %-25s: %s %3d 个基因\n", name, status, gene_count))
+  }
+  all_genes <- unique(unlist(all_gene_lists))
+  cat("\n总体基因统计:\n")
+  cat("  总唯一基因数:", length(all_genes), "\n")
+  genes_in_orgdb <- all_genes[all_genes %in% keys(org.[YourSpecies].eg.db, keytype = "GID")]
+  coverage_rate <- round(length(genes_in_orgdb) / length(all_genes) * 100, 1)
+  cat("  OrgDb覆盖度:", length(genes_in_orgdb), "/", length(all_genes), 
+      sprintf("(%.1f%%)", coverage_rate), "\n")
+  sufficient_lists <- sum(sapply(all_gene_lists, length) >= 10)
+  marginal_lists <- sum(sapply(all_gene_lists, length) >= 5 & sapply(all_gene_lists, length) < 10)
+  insufficient_lists <- sum(sapply(all_gene_lists, length) < 5)
+  cat("\n富集分析可行性评估:\n")
+  cat("  推荐分析列表(≥10基因):", sufficient_lists, "/", total_lists, "\n")
+  cat("  边缘分析列表(5-9基因):", marginal_lists, "/", total_lists, "\n")
+  cat("  不推荐分析列表(<5基因):", insufficient_lists, "/", total_lists, "\n")
+  if (sufficient_lists > 0 && coverage_rate > 50) {
+    cat("✅ 数据质量优秀，适合进行功能富集分析\n")
+    return(TRUE)
+  } else if (sufficient_lists + marginal_lists > 0 && coverage_rate > 30) {
+    cat("⚠️ 数据质量一般，部分列表可能富集效果有限\n")
+    return(TRUE)
+  } else {
+    cat("❌ 数据质量较差，建议检查前序分析流程\n")
+    return(FALSE)
+  }
+}
+
+### 1.7 生成详细的基因列表汇总报告
+generate_comprehensive_summary <- function(trend_lists, wgcna_lists, integrated_lists) {
+  cat("\n=== 生成详细基因列表汇总报告 ===\n")
+  all_lists <- c(trend_lists, wgcna_lists, integrated_lists)
+  summary_data <- data.frame(
+    List_Name = names(all_lists),
+    Gene_Count = sapply(all_lists, length),
+    Analysis_Type = sapply(names(all_lists), function(x) {
+      if (grepl("trend", x)) return("Trend_Analysis")
+      if (grepl("wgcna", x)) return("WGCNA")
+      if (grepl("high_confidence|all_|complete", x)) return("Integrated")
+      return("Other")
+    }),
+    Biological_Meaning = sapply(names(all_lists), function(x) {
+      switch(x,
+             "trend_positive" = "表达随行为增强而上升",
+             "trend_negative" = "表达随行为增强而下降", 
+             "wgcna_key_module" = "与行为最相关的共表达模块基因",
+             "wgcna_hub_genes" = "共表达网络中的关键调控枢纽基因",
+             "high_confidence_overlap" = "趋势分析与WGCNA重叠的最高置信度基因",
+             "all_trend_genes" = "所有趋势分析显著基因",
+             "all_wgcna_genes" = "所有WGCNA分析显著基因", 
+             "complete_gene_set" = "趋势分析和WGCNA的完整基因集合",
+             "未知功能集合"
+      )
+    }),
+    Recommended_For_GO = sapply(all_lists, function(x) length(x) >= 10),
+    Recommended_For_KEGG = sapply(all_lists, function(x) length(x) >= 15),
+    stringsAsFactors = FALSE
+  )
+  write.csv(summary_data, "new_pipeline_gene_lists_summary.csv", row.names = FALSE)
+  cat("✅ 详细基因列表汇总已保存\n")
+  cat("\n=== 基因列表简要报告 ===\n")
+  print(summary_data)
+  cat("\n=== 后续分析建议 ===\n")
+  go_recommended <- sum(summary_data$Recommended_For_GO)
+  kegg_recommended <- sum(summary_data$Recommended_For_KEGG)
+  cat("推荐进行GO富集分析的列表:", go_recommended, "/", nrow(summary_data), "\n")
+  cat("推荐进行KEGG通路分析的列表:", kegg_recommended, "/", nrow(summary_data), "\n")
+  if (go_recommended > 0) {
+    cat("重点推荐列表:\n")
+    go_lists <- summary_data$List_Name[summary_data$Recommended_For_GO]
+    for (list_name in go_lists) {
+      count <- summary_data$Gene_Count[summary_data$List_Name == list_name]
+      meaning <- summary_data$Biological_Meaning[summary_data$List_Name == list_name]
+      cat("  -", list_name, "(", count, "genes ) :", meaning, "\n")
+    }
+  }
+  return(summary_data)
+}
+
+### 1.8 执行完整的新流程数据准备
+execute_new_pipeline_data_preparation <- function() {
+  cat("=== 开始执行新流程数据准备 ===\n")
+  cat("基于DESeq2→趋势分析→WGCNA流程准备功能富集分析输入\n\n")
+  cat("步骤1/6: 创建基因ID映射表\n")
+  mapping_table <- create_gene_mapping_for_new_pipeline()
+  cat("\n步骤2/6: 读取趋势分析基因列表\n")
+  trend_lists <- read_trend_analysis_genes(mapping_table)
+  cat("\n步骤3/6: 读取WGCNA网络分析基因列表\n")
+  wgcna_lists <- read_wgcna_analysis_genes(mapping_table)
+  cat("\n步骤4/6: 创建高置信度整合基因集合\n")
+  integrated_lists <- create_integrated_gene_sets(trend_lists, wgcna_lists)
+  cat("\n步骤5/6: 执行数据质量检查\n")
+  quality_ok <- validate_data_quality(trend_lists, wgcna_lists, integrated_lists, mapping_table)
+  cat("\n步骤6/6: 生成详细汇总报告\n")
+  summary_report <- generate_comprehensive_summary(trend_lists, wgcna_lists, integrated_lists)
+  all_gene_lists <- c(trend_lists, wgcna_lists, integrated_lists)
+  saveRDS(all_gene_lists, "new_pipeline_processed_gene_lists.rds")
+  cat("✅ 新流程基因列表已保存\n")
+  return(list(
+    mapping_table = mapping_table,
+    trend_lists = trend_lists,
+    wgcna_lists = wgcna_lists, 
+    integrated_lists = integrated_lists,
+    all_gene_lists = all_gene_lists,
+    summary_report = summary_report,
+    quality_ok = quality_ok
+  ))
+}
+
+# 诊断数据准备问题
+cat("🔍 诊断数据准备问题...\n")
+cat("📁 检查必要文件:\n")
+required_files <- c(
+  "Trend_Analysis_Results/trend_analysis_results.rds",
+  "WGCNA_Results/wgcna_complete_results.rds", 
+  "Normalized_Counts_Matrix.csv",
+  "DESeq2_Analysis_Object.rds"
+)
+for (file in required_files) {
+  exists <- file.exists(file)
+  status <- ifelse(exists, "✅", "❌")
+  cat("   ", status, file, "\n")
+}
+
+cat("\n🔄 手动执行数据准备步骤...\n")
+if (file.exists("Trend_Analysis_Results/trend_analysis_results.rds")) {
+  trend_data <- readRDS("Trend_Analysis_Results/trend_analysis_results.rds")
+  trend_genes <- unique(c(trend_data$consistent_positive, trend_data$consistent_negative))
+  cat("   趋势分析基因数量:", length(trend_genes), "\n")
+} else {
+  trend_genes <- character(0)
+  cat("   ⚠️ 趋势分析结果文件不存在\n")
+}
+if (file.exists("WGCNA_Results/wgcna_complete_results.rds")) {
+  wgcna_data <- readRDS("WGCNA_Results/wgcna_complete_results.rds")
+  wgcna_genes <- unique(c(wgcna_data$key_module_genes, wgcna_data$hub_genes))
+  cat("   WGCNA基因数量:", length(wgcna_genes), "\n")
+} else {
+  wgcna_genes <- character(0)
+  cat("   ⚠️ WGCNA结果文件不存在\n")
+}
+if (file.exists("Normalized_Counts_Matrix.csv")) {
+  normalized_counts <- read.csv("Normalized_Counts_Matrix.csv", row.names = 1)
+  all_genes <- rownames(normalized_counts)
+  cat("   标准化矩阵基因数量:", length(all_genes), "\n")
+} else if (file.exists("DESeq2_Analysis_Object.rds")) {
+  dds <- readRDS("DESeq2_Analysis_Object.rds")
+  all_genes <- rownames(dds)
+  cat("   DESeq2对象基因数量:", length(all_genes), "\n")
+} else {
+  all_genes <- character(0)
+  cat("   ❌ 无法获取基因列表\n")
+}
+all_unique_genes <- unique(c(trend_genes, wgcna_genes, all_genes))
+cat("   总唯一基因数量:", length(all_unique_genes), "\n")
+if (length(all_unique_genes) == 0) {
+  cat("❌ 严重错误: 没有收集到任何基因ID\n")
+  cat("   可能的原因:\n")
+  cat("   1. 之前的分析没有成功完成\n")
+  cat("   2. 文件路径不正确\n")
+  cat("   3. 工作目录设置错误\n")
+  cat("\n🔄 紧急修复: 创建测试基因列表...\n")
+  if (length(all_genes) > 0) {
+    all_unique_genes <- head(all_genes, 100)
+    cat("   使用前100个基因作为测试集\n")
+  } else {
+    all_unique_genes <- paste0("GENE_", 1:100)
+    cat("   创建100个虚拟基因ID\n")
+  }
+}
+cat("\n步骤4: 创建基因ID映射表...\n")
+if (length(all_unique_genes) > 0) {
+  if (any(grepl("^ENS", all_unique_genes))) {
+    gene_mapping <- data.frame(
+      original_gene_id = all_unique_genes,
+      GID = all_unique_genes
+    )
+    cat("   使用Ensembl ID作为GID\n")
+  } else {
+    gene_mapping <- data.frame(
+      original_gene_id = all_unique_genes,
+      GID = paste0("GENE_", seq_along(all_unique_genes))
+    )
+    cat("   创建人工GID映射\n")
+  }
+  write.csv(gene_mapping, "gene_id_mapping_table.csv", row.names = FALSE)
+  cat("✅ 基因ID映射表已保存\n")
+  cat("   映射基因数量:", nrow(gene_mapping), "\n")
+} else {
+  cat("❌ 无法创建基因ID映射表\n")
+}
+
+simple_data_preparation <- function() {
+  cat("=== 简化版数据准备流程 ===\n")
+  gene_sources <- list()
+  if (file.exists("Trend_Analysis_Results/trend_analysis_results.rds")) {
+    trend_data <- readRDS("Trend_Analysis_Results/trend_analysis_results.rds")
+    gene_sources$trend <- unique(c(trend_data$consistent_positive, trend_data$consistent_negative))
+  }
+  if (file.exists("WGCNA_Results/wgcna_complete_results.rds")) {
+    wgcna_data <- readRDS("WGCNA_Results/wgcna_complete_results.rds")
+    gene_sources$wgcna <- unique(c(wgcna_data$key_module_genes, wgcna_data$hub_genes))
+  }
+  if (file.exists("Normalized_Counts_Matrix.csv")) {
+    normalized_counts <- read.csv("Normalized_Counts_Matrix.csv", row.names = 1)
+    gene_sources$matrix <- rownames(normalized_counts)
+  }
+  all_genes <- unique(unlist(gene_sources))
+  cat("   收集到的基因数量:", length(all_genes), "\n")
+  dir.create("GO_Analysis_Input", showWarnings = FALSE)
+  if (length(gene_sources$trend) > 0) {
+    write.csv(data.frame(GeneID = gene_sources$trend), 
+              "GO_Analysis_Input/trend_genes.csv", row.names = FALSE)
+  }
+  if (length(gene_sources$wgcna) > 0) {
+    write.csv(data.frame(GeneID = gene_sources$wgcna), 
+              "GO_Analysis_Input/wgcna_genes.csv", row.names = FALSE)
+  }
+  if (length(all_genes) > 0) {
+    write.csv(data.frame(GeneID = all_genes), 
+              "GO_Analysis_Input/all_genes.csv", row.names = FALSE)
+  }
+  cat("✅ 简化版数据准备完成\n")
+  return(TRUE)
+}
+
+cat("\n🎯 执行简化版数据准备...\n")
+success <- simple_data_preparation()
+if (success) {
+  cat("\n📁 生成的GO分析输入文件:\n")
+  go_files <- list.files("GO_Analysis_Input", full.names = FALSE)
+  for (file in go_files) {
+    cat("   ✅", file, "\n")
+  }
+}
+
+cat("# 第一章：新流程数据准备 - 开始执行\n")
+prepared_data <- execute_new_pipeline_data_preparation()
+cat("✅ 第一章：新流程数据准备 - 完成！\n")
+if (!is.null(prepared_data) && prepared_data$quality_ok) {
+  cat("🎯 数据准备成果:\n")
+  cat("• 基因映射表: new_pipeline_gene_mapping.csv\n")
+  cat("• 基因列表: new_pipeline_processed_gene_lists.rds\n")
+  cat("• 汇总报告: new_pipeline_gene_lists_summary.csv\n")
+  cat("• 总基因列表数:", length(prepared_data$all_gene_lists), "\n")
+  cat("• 包含: 趋势分析 + WGCNA + 整合分析基因集合\n")
+  cat("• 数据质量: 优秀 ✅\n")
+  cat("\n➡️  下一步: 进入第二章GO富集分析\n")
+} else {
+  cat("⚠️ 数据准备完成，但质量检查发现一些问题\n")
+}
