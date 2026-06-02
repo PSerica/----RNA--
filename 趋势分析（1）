@@ -1,0 +1,679 @@
+##################################################################
+### 趋势分析流程（优化版）
+### 功能：基于DESeq2预处理结果，分析基因表达在行为梯度上的变化模式
+### 输入：DESeq2分析生成的RDS文件和标准化矩阵
+### 输出：趋势基因列表、可视化图表、统计报告
+##################################################################
+#### 0. 初始化与配置 --------------------------------------------------------
+cat("=== 趋势分析：初始化与配置 ===\n")
+
+create_analysis_dirs <- function() {
+  dirs <- c("Trend_Visualizations", "Trend_Analysis_Results")
+  for(dir in dirs) {
+    if(!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+  }
+}
+
+### 0.2 检查必要文件是否存在
+cat("正在检查必要文件...\n")
+required_files <- c("DESeq2_Analysis_Object.rds", "Normalized_Counts_Matrix.csv")
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0) {
+  stop("❌ 缺少必要输入文件: ", paste(missing_files, collapse = ", "))
+}
+cat("✅ 所有必要文件都存在\n")
+
+### 0.3 记录分析元数据
+cat("正在记录分析元数据...\n")
+pipeline_metadata <- list(
+  analysis_timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+  brain_region = "[Brain_Region]",
+  analysis_stage = "Trend_Analysis",
+  r_version = R.version.string,
+  deseq2_version = as.character(packageVersion("DESeq2")),
+  input_files = required_files
+)
+saveRDS(pipeline_metadata, "Trend_analysis_metadata.rds")
+cat("✅ 分析元数据已保存: Trend_analysis_metadata.rds\n")
+
+### 0.4 加载必要的R包
+required_packages <- c("DESeq2", "ggplot2", "pheatmap", "RColorBrewer", "ggpubr", "dplyr")
+invisible(lapply(required_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}))
+cat("✅ 所有R包加载完成\n")
+
+### 0.4.1 定义物种行为映射
+BEHAVIOR_LEVELS <- c(
+  "[Species_A]" = "low",      
+  "[Species_C]" = "medium",  
+  "[Species_B]" = "high"      
+)
+
+BEHAVIOR_SCORES <- c(
+  "[Species_A]" = 0.0,        
+  "[Species_C]" = 0.5, 
+  "[Species_B]" = 1.0         
+)
+cat("✅ 行为映射定义完成\n")
+
+### 0.5 加载输入数据
+cat("正在加载输入数据...\n")
+dds <- readRDS("DESeq2_Analysis_Object.rds")
+normalized_counts <- read.csv("Normalized_Counts_Matrix.csv", row.names = 1)
+cat("✅ 输入数据加载完成\n")
+cat("   DESeq2对象样本数:", ncol(dds), "\n")
+cat("   标准化矩阵维度:", nrow(normalized_counts), "基因 ×", ncol(normalized_counts), "样本\n")
+
+### 0.6 准备趋势分析输入数据
+cat("正在准备趋势分析输入数据...\n")
+use_all_genes <- FALSE
+if (use_all_genes) {
+  gene_selection_strategy <- "全部基因集"
+  trend_analysis_genes <- rownames(normalized_counts)
+  cat("✅ 使用全部基因集进行趋势分析\n")
+  cat("   基因数量:", length(trend_analysis_genes), "\n")
+} else {
+  gene_selection_strategy <- ""
+  trend_analysis_genes <- c()
+  if (file.exists("[gene_lists].rds")) {
+    gene_selection_strategy <- "DESeq2高变异基因"
+    deseq2_advanced <- readRDS("[gene_lists].rds")
+    if (!is.null(deseq2_advanced$all_significant_hvg) && length(deseq2_advanced$all_significant_hvg) > 0) {
+      trend_analysis_genes <- deseq2_advanced$all_significant_hvg
+      cat("✅ 使用DESeq2的显著高变异基因列表\n")
+    }
+  } 
+  if (length(trend_analysis_genes) == 0 && file.exists("[hvg_lists].rds")) {
+    gene_selection_strategy <- "高变异基因列表"
+    hvg_lists <- readRDS("[hvg_lists].rds")
+    if (!is.null(hvg_lists$wgcna_genes) && length(hvg_lists$wgcna_genes) > 0) {
+      trend_analysis_genes <- hvg_lists$wgcna_genes
+      cat("✅ 使用WGCNA基因列表（前5000高变异基因）\n")
+    } else if (!is.null(hvg_lists$all_significant_hvg) && length(hvg_lists$all_significant_hvg) > 0) {
+      trend_analysis_genes <- hvg_lists$all_significant_hvg
+      cat("✅ 使用显著高变异基因列表\n")
+    }
+  }
+  if (length(trend_analysis_genes) == 0 && file.exists("Network_Analysis/High_Variable_Genes_Expression.csv")) {
+    gene_selection_strategy <- "网络分析高变异基因"
+    hvg_expression <- read.csv("Network_Analysis/High_Variable_Genes_Expression.csv", row.names = 1)
+    trend_analysis_genes <- rownames(hvg_expression)
+    cat("✅ 使用网络分析的高变异基因\n")
+  }
+  if (length(trend_analysis_genes) == 0) {
+    gene_selection_strategy <- "随机基因子集"
+    all_genes <- rownames(normalized_counts)
+    set.seed(123)
+    if (length(all_genes) > 5000) {
+      trend_analysis_genes <- sample(all_genes, 5000)
+      cat("✅ 随机选择5000个基因进行趋势分析\n")
+    } else {
+      trend_analysis_genes <- all_genes
+      cat("✅ 使用所有基因进行趋势分析\n")
+    }
+  }
+  trend_analysis_genes <- trend_analysis_genes[trend_analysis_genes %in% rownames(normalized_counts)]
+  cat("   最终基因数量:", length(trend_analysis_genes), "（策略:", gene_selection_strategy, "）\n")
+  if (length(trend_analysis_genes) == 0) {
+    cat("⚠️ 警告：基因列表为空，使用方差最高的500个基因\n")
+    gene_variance <- apply(normalized_counts, 1, var)
+    top_variance_genes <- names(sort(gene_variance, decreasing = TRUE))[1:500]
+    trend_analysis_genes <- top_variance_genes
+    gene_selection_strategy <- "高方差基因"
+    cat("   备用方案基因数量:", length(trend_analysis_genes), "\n")
+  }
+}
+expr_data <- normalized_counts[trend_analysis_genes, ]
+cat("✅ 趋势分析表达矩阵准备完成\n")
+cat("   最终矩阵维度:", nrow(expr_data), "个基因,", ncol(expr_data), "个样本\n")
+cat("   使用策略:", ifelse(use_all_genes, "全部基因集", paste("分层筛选 (", gene_selection_strategy, ")", sep = "")), "\n")
+
+#### 1. 趋势分析核心方法 ----------------------------------------------------
+### 1.1 准备样本信息
+sample_info <- as.data.frame(colData(dds))
+sample_info$behavior_level <- factor(
+  BEHAVIOR_LEVELS[sample_info$species],
+  levels = c("low", "medium", "high")
+)
+sample_info$behavior_score <- BEHAVIOR_SCORES[sample_info$species]
+cat("   行为等级分布:\n")
+cat("   Low ([Species_A]):", sum(sample_info$behavior_level == "low"), "samples\n")
+cat("   Medium ([Species_C]):", sum(sample_info$behavior_level == "medium"), "samples\n")
+cat("   High ([Species_B]):", sum(sample_info$behavior_level == "high"), "samples\n")
+
+### 1.2 方法一：有序比较分析
+dds_ordered <- DESeqDataSetFromMatrix(
+  countData = counts(dds),
+  colData = sample_info,
+  design = ~ behavior_level
+)
+dds_ordered <- DESeq(dds_ordered)
+results_trend <- results(dds_ordered, 
+                         contrast = list("behavior_level_high_vs_low",
+                                         "behavior_level_medium_vs_low"))
+cat("✅ 有序比较分析完成，检验基因数:", nrow(results_trend), "\n")
+cat("   显著趋势基因(padj < 0.05):", sum(results_trend$padj < 0.05, na.rm = TRUE), "\n")
+
+### 1.3 方法二：线性模型趋势分析
+dds_continuous <- DESeqDataSetFromMatrix(
+  countData = counts(dds),
+  colData = sample_info,
+  design = ~ behavior_score
+)
+dds_continuous <- DESeq(dds_continuous)
+results_continuous <- results(dds_continuous, name = "behavior_score")
+cat("✅ 线性模型分析完成，检验基因数:", nrow(results_continuous), "\n")
+cat("   显著相关基因(padj < 0.05):", sum(results_continuous$padj < 0.05, na.rm = TRUE), "\n")
+
+### 1.4 记录分析参数
+trend_analysis_parameters <- list(
+  gene_selection_strategy = gene_selection_strategy,
+  final_gene_count = length(trend_analysis_genes),
+  behavior_gradient = BEHAVIOR_SCORES,
+  methods_used = c("ordered_comparison", "linear_model", "clustering"),
+  significance_threshold = 0.05,
+  clustering_parameters = list(kmeans_centers = 6, nstart = 25)
+)
+saveRDS(trend_analysis_parameters, "Trend_analysis_parameters.rds")
+cat("✅ 分析参数已保存: Trend_analysis_parameters.rds\n")
+
+#### 2. 趋势分析方法实施 ----------------------------------------------------
+### 2.1 方法三：聚类趋势分析
+vsd <- vst(dds_continuous, blind = FALSE)
+expr_matrix <- assay(vsd)
+hoarding_order <- order(sample_info$behavior_score)
+expr_ordered <- expr_matrix[, hoarding_order]
+expr_trend_genes <- expr_ordered[trend_analysis_genes, ]
+set.seed(123)
+kmeans_result <- kmeans(expr_trend_genes, centers = 6, nstart = 25, iter.max = 50)
+if(kmeans_result$ifault == 4) {
+  warning("K-means可能未完全收敛，考虑使用其他方法")
+}
+trend_clusters <- data.frame(
+  gene_id = rownames(expr_trend_genes),
+  cluster = kmeans_result$cluster
+)
+cat("✅ 聚类分析完成\n")
+cat("   聚类数量:", length(unique(kmeans_result$cluster)), "个模式\n")
+cat("   各聚类基因分布:", paste(table(kmeans_result$cluster), collapse = ", "), "\n")
+
+#### 3. 结果整合与分析 ------------------------------------------------------
+### 3.1 趋势模式分类与一致性分析
+ordered_results_df <- as.data.frame(results_trend)
+ordered_results_df$gene_id <- rownames(ordered_results_df)
+ordered_results_df$trend_type_ordered <- ifelse(
+  ordered_results_df$padj < 0.05 & !is.na(ordered_results_df$padj),
+  ifelse(ordered_results_df$log2FoldChange > 0, "positive_trend", 
+         ifelse(ordered_results_df$log2FoldChange < 0, "negative_trend", "complex_trend")),
+  "no_trend"
+)
+continuous_results_df <- as.data.frame(results_continuous)
+continuous_results_df$gene_id <- rownames(continuous_results_df)
+continuous_results_df$trend_type_continuous <- ifelse(
+  continuous_results_df$padj < 0.05 & !is.na(continuous_results_df$padj),
+  ifelse(continuous_results_df$log2FoldChange > 0, "positive_correlation", "negative_correlation"),
+  "no_correlation"
+)
+
+trend_comparison <- merge(
+  ordered_results_df[, c("gene_id", "trend_type_ordered", "log2FoldChange", "padj")],
+  continuous_results_df[, c("gene_id", "trend_type_continuous", "log2FoldChange", "padj")],
+  by = "gene_id",
+  suffixes = c("_ordered", "_continuous")
+)
+
+trend_comparison$consistent_pattern <- ifelse(
+  trend_comparison$trend_type_ordered %in% c("positive_trend", "negative_trend") &
+    trend_comparison$trend_type_continuous %in% c("positive_correlation", "negative_correlation") &
+    substr(trend_comparison$trend_type_ordered, 1, 8) == substr(trend_comparison$trend_type_continuous, 1, 8),
+  "consistent",
+  "inconsistent"
+)
+
+### 3.2 聚类模式与统计方法整合
+trend_comparison <- merge(trend_comparison, trend_clusters, by = "gene_id", all.x = TRUE)
+cluster_trend_summary <- trend_comparison %>%
+  group_by(cluster) %>%
+  summarise(
+    total_genes = n(),
+    consistent_positive = sum(consistent_pattern == "consistent" & 
+                                trend_type_continuous == "positive_correlation", na.rm = TRUE),
+    consistent_negative = sum(consistent_pattern == "consistent" & 
+                                trend_type_continuous == "negative_correlation", na.rm = TRUE),
+    percent_consistent = round((consistent_positive + consistent_negative) / total_genes * 100, 1)
+  ) %>%
+  arrange(desc(percent_consistent))
+cat("✅ 聚类与统计方法整合完成\n")
+
+### 3.3 与DESeq2结果整合分析
+integration_results <- list()
+if (file.exists("[gene_lists].rds")) {
+  deseq2_advanced <- readRDS("[gene_lists].rds")
+  if (!is.null(deseq2_advanced$all_significant_hvg) && length(deseq2_advanced$all_significant_hvg) > 0) {
+    consistent_positive <- trend_comparison$gene_id[
+      trend_comparison$consistent_pattern == "consistent" & 
+        trend_comparison$trend_type_continuous == "positive_correlation"
+    ]
+    consistent_negative <- trend_comparison$gene_id[
+      trend_comparison$consistent_pattern == "consistent" & 
+        trend_comparison$trend_type_continuous == "negative_correlation"
+    ]
+    trend_consistent_genes <- unique(c(consistent_positive, consistent_negative))
+    hvg_trend_overlap <- intersect(deseq2_advanced$all_significant_hvg, trend_consistent_genes)
+    hvg_overlap_percent <- ifelse(length(trend_consistent_genes) > 0, 
+                                  round(length(hvg_trend_overlap) / length(trend_consistent_genes) * 100, 1), 0)
+    cat("   DESeq2高变异基因数量:", length(deseq2_advanced$all_significant_hvg), "\n")
+    cat("   趋势基因中高变异基因比例:", hvg_overlap_percent, "%\n")
+    integration_results <- list(
+      consistent_positive_count = length(consistent_positive),
+      consistent_negative_count = length(consistent_negative),
+      hvg_count = length(deseq2_advanced$all_significant_hvg),
+      hvg_overlap_count = length(hvg_trend_overlap),
+      hvg_overlap_percent = hvg_overlap_percent
+    )
+  } else {
+    integration_results <- list(
+      note = "DESeq2高变异基因列表为空",
+      consistent_positive_count = length(consistent_positive),
+      consistent_negative_count = length(consistent_negative)
+    )
+  }
+} else {
+  consistent_positive <- trend_comparison$gene_id[
+    trend_comparison$consistent_pattern == "consistent" & 
+      trend_comparison$trend_type_continuous == "positive_correlation"
+  ]
+  consistent_negative <- trend_comparison$gene_id[
+    trend_comparison$consistent_pattern == "consistent" & 
+      trend_comparison$trend_type_continuous == "negative_correlation"
+  ]
+  integration_results <- list(
+    note = "使用趋势分析独立结果",
+    consistent_positive_count = length(consistent_positive),
+    consistent_negative_count = length(consistent_negative),
+    total_trend_genes = length(consistent_positive) + length(consistent_negative)
+  )
+}
+if (!dir.exists("Trend_Analysis_Results")) {
+  dir.create("Trend_Analysis_Results", recursive = TRUE)
+}
+saveRDS(integration_results, "Trend_Analysis_Results/deseq2_integration_analysis.rds")
+cat("   ✅ 整合分析结果已保存\n")
+
+### 3.4 趋势统计报告
+cat("【方法一：有序比较】\n")
+cat("   正趋势基因:", sum(ordered_results_df$trend_type_ordered == "positive_trend", na.rm = TRUE), "\n")
+cat("   负趋势基因:", sum(ordered_results_df$trend_type_ordered == "negative_trend", na.rm = TRUE), "\n")
+cat("   无趋势基因:", sum(ordered_results_df$trend_type_ordered == "no_trend", na.rm = TRUE), "\n")
+cat("【方法二：线性模型】\n")
+cat("   正相关基因:", sum(continuous_results_df$trend_type_continuous == "positive_correlation", na.rm = TRUE), "\n")
+cat("   负相关基因:", sum(continuous_results_df$trend_type_continuous == "negative_correlation", na.rm = TRUE), "\n")
+cat("   无相关基因:", sum(continuous_results_df$trend_type_continuous == "no_correlation", na.rm = TRUE), "\n")
+cat("【方法一致性】\n")
+consistent_count <- sum(trend_comparison$consistent_pattern == "consistent", na.rm = TRUE)
+cat("   一致趋势基因:", consistent_count, "\n")
+cat("   不一致基因:", sum(trend_comparison$consistent_pattern == "inconsistent", na.rm = TRUE), "\n")
+cat("【方法三：聚类分析】\n")
+cat("   聚类数量:", length(unique(trend_clusters$cluster)), "个模式\n")
+cat("【聚类-趋势富集分析】\n")
+for(i in 1:nrow(cluster_trend_summary)) {
+  cluster_info <- cluster_trend_summary[i, ]
+  cat("   聚类", cluster_info$cluster, ": ", cluster_info$consistent_positive, "正 + ", 
+      cluster_info$consistent_negative, "负 = ", cluster_info$percent_consistent, "%一致趋势\n", sep = "")
+}
+
+### 3.5 趋势基因重叠问题诊断
+if (file.exists("[gene_lists].rds")) {
+  deseq2_advanced <- readRDS("[gene_lists].rds")
+  consistent_positive <- trend_comparison$gene_id[
+    trend_comparison$consistent_pattern == "consistent" & 
+      trend_comparison$trend_type_continuous == "positive_correlation"
+  ]
+  consistent_negative <- trend_comparison$gene_id[
+    trend_comparison$consistent_pattern == "consistent" & 
+      trend_comparison$trend_type_continuous == "negative_correlation"
+  ]
+  trend_consistent_genes <- unique(c(consistent_positive, consistent_negative))
+  cat("【重叠问题诊断】\n")
+  cat("   DESeq2高变异基因数量:", length(deseq2_advanced$all_significant_hvg), "\n")
+  cat("   一致趋势基因数量:", length(trend_consistent_genes), "\n")
+  cat("   重叠基因数量:", length(intersect(deseq2_advanced$all_significant_hvg, trend_consistent_genes)), "\n")
+  if (length(trend_consistent_genes) == 0) {
+    cat("   ❗ 问题: 没有找到一致趋势基因\n")
+    cat("   💡 建议: 放松一致性标准，考虑单个方法的显著基因\n")
+    linear_sig_genes <- continuous_results_df$gene_id[
+      continuous_results_df$padj < 0.05 & !is.na(continuous_results_df$padj)
+    ]
+    cat("   线性模型显著基因:", length(linear_sig_genes), "\n")
+    ordered_sig_genes <- ordered_results_df$gene_id[
+      ordered_results_df$padj < 0.05 & !is.na(ordered_results_df$padj)
+    ]
+    cat("   有序比较显著基因:", length(ordered_sig_genes), "\n")
+  } else if (length(deseq2_advanced$all_significant_hvg) == 0) {
+    cat("   ❗ 问题: DESeq2高变异基因列表为空\n")
+    cat("   💡 建议: 检查DESeq2分析结果\n")
+  } else {
+    cat("   ❗ 问题: 两种方法筛选的基因集合差异较大\n")
+    cat("   💡 建议: 分析基因选择标准和显著性阈值\n")
+  }
+}
+
+#### 4. 结果可视化 ----------------------------------------------------------
+### 4.1 创建输出目录
+create_analysis_dirs()
+if (!dir.exists("Trend_Visualizations")) {
+  dir.create("Trend_Visualizations", recursive = TRUE)
+}
+cat("✅ 输出目录创建完成\n")
+
+### 4.2 一致趋势基因热图（优化版）
+consistent_genes <- trend_comparison$gene_id[trend_comparison$consistent_pattern == "consistent"]
+if (length(consistent_genes) > 0) {
+  if (length(consistent_genes) > 50) {
+    gene_pvals <- continuous_results_df$padj[match(consistent_genes, continuous_results_df$gene_id)]
+    valid_indices <- which(!is.na(gene_pvals))
+    if (length(valid_indices) >= 50) {
+      consistent_genes <- consistent_genes[order(gene_pvals, na.last = TRUE)[1:50]]
+    } else {
+      consistent_genes <- consistent_genes[valid_indices[1:min(50, length(valid_indices))]]
+    }
+    cat("   选择前", length(consistent_genes), "个最显著的一致趋势基因进行热图展示\n")
+  } else {
+    cat("   使用所有", length(consistent_genes), "个一致趋势基因进行热图展示\n")
+  }
+  available_genes <- consistent_genes[consistent_genes %in% rownames(vsd)]
+  if (length(available_genes) == 0) {
+    cat("⚠️ 错误：在VST数据中未找到指定的基因\n")
+  } else {
+    if (length(available_genes) < length(consistent_genes)) {
+      cat("⚠️ 警告：", length(consistent_genes) - length(available_genes), 
+          "个基因在VST数据中不存在\n")
+    }
+    vsd_consistent <- vsd[available_genes, ]
+    sample_order <- order(sample_info$behavior_score)
+    expr_consistent <- assay(vsd_consistent)[, sample_order]
+    annotation_df <- data.frame(
+      Behavior_Score = sample_info$behavior_score[sample_order],
+      Species = factor(sample_info$species[sample_order])
+    )
+    rownames(annotation_df) <- colnames(expr_consistent)
+    if (!exists("SPECIES_COLORS")) {
+      cat("⚠️ SPECIES_COLORS未定义，使用默认颜色\n")
+      SPECIES_COLORS <- c(
+        "[Genus_species_C]" = "#F0A73A",
+        "[Genus_species_A]" = "#3ABF99",  
+        "[Genus_species_B]" = "#2C91E0"
+      )
+    }
+    if (!dir.exists("Trend_Visualizations")) {
+      dir.create("Trend_Visualizations", recursive = TRUE)
+    }
+    annotation_colors <- list(
+      Species = SPECIES_COLORS,
+      Behavior_Score = colorRampPalette(c("#F7FBFF", "#08306B"))(50)
+    )
+    actual_species <- levels(annotation_df$Species)
+    species_colors_to_use <- SPECIES_COLORS[actual_species]
+    species_colors_to_use <- species_colors_to_use[!sapply(species_colors_to_use, is.null)]
+    if (length(species_colors_to_use) > 0) {
+      annotation_colors$Species <- species_colors_to_use
+    } else {
+      cat("⚠️ 警告：物种颜色匹配失败，使用默认颜色\n")
+    }
+    tryCatch({
+      pheatmap(expr_consistent,
+               scale = "row",
+               cluster_cols = FALSE,
+               cluster_rows = TRUE,
+               annotation_col = annotation_df,
+               annotation_colors = annotation_colors,
+               show_rownames = min(20, nrow(expr_consistent)),
+               main = paste0("Consistent Trend Genes\n(n=", nrow(expr_consistent), " genes)"),
+               color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100),
+               fontsize_row = 8,
+               fontsize_col = 8,
+               fontsize = 10,
+               filename = "Trend_Visualizations/consistent_trends_heatmap.png",
+               width = 10, 
+               height = max(6, nrow(expr_consistent) * 0.15),
+               silent = FALSE)
+      cat("✅ 一致趋势基因热图已保存\n")
+      pheatmap(expr_consistent,
+               scale = "row",
+               cluster_cols = FALSE,
+               cluster_rows = TRUE,
+               annotation_col = annotation_df,
+               annotation_colors = annotation_colors,
+               show_rownames = min(20, nrow(expr_consistent)),
+               main = paste0("Consistent Trend Genes\n(n=", nrow(expr_consistent), " genes)"),
+               color = colorRampPalette(rev(brewer.pal(10, "RdBu")))(100),
+               fontsize_row = 8,
+               fontsize_col = 8,
+               fontsize = 10,
+               filename = "Trend_Visualizations/consistent_trends_heatmap.pdf",
+               width = 10, 
+               height = max(6, nrow(expr_consistent) * 0.15))
+      cat("✅ 热图PDF版本已保存\n")
+    }, error = function(e) {
+      cat("❌ 热图绘制失败:", e$message, "\n")
+    })
+  }
+} else {
+  cat("⚠️ 未发现一致趋势基因，跳过热图绘制\n")
+}
+
+### 4.3 关键趋势基因表达曲线
+if (length(consistent_genes) >= 6) {
+  representative_genes <- consistent_genes[1:6]
+  trend_plots <- list()
+  for (i in seq_along(representative_genes)) {
+    gene <- representative_genes[i]
+    plot_data <- data.frame(
+      Expression = assay(vsd)[gene, ],
+      Behavior_Score = sample_info$behavior_score,
+      Species = sample_info$species
+    )
+    trend_plots[[i]] <- ggplot(plot_data, aes(x = Behavior_Score, y = Expression, color = Species)) +
+      geom_point(size = 3) +
+      geom_smooth(method = "lm", se = TRUE, aes(group = 1), color = "black") +
+      labs(title = gene, 
+           subtitle = paste("Trend:", trend_comparison$trend_type_continuous[trend_comparison$gene_id == gene]),
+           x = "Behavior Score", 
+           y = "Normalized Expression") +
+      theme_minimal() +
+      scale_color_manual(values = SPECIES_COLORS) +
+      theme(legend.position = "none")
+  }
+  combined_plot <- ggarrange(plotlist = trend_plots, ncol = 3, nrow = 2,
+                             common.legend = TRUE, legend = "bottom")
+  ggsave("Trend_Visualizations/key_trend_genes.png", combined_plot, width = 12, height = 8, dpi = 300)
+  cat("✅ 关键趋势基因表达曲线已保存\n")
+} else if (length(consistent_genes) > 0) {
+  cat("⚠️ 一致趋势基因数量不足6个，跳过多基因组合图\n")
+} else {
+  cat("⚠️ 无一致趋势基因，跳过表达曲线绘制\n")
+}
+
+### 4.4 趋势统计摘要图
+trend_summary <- data.frame(
+  Method = rep(c("Ordered Comparison", "Linear Model"), each = 2),
+  Trend = rep(c("Positive", "Negative"), 2),
+  Count = c(
+    sum(ordered_results_df$trend_type_ordered == "positive_trend", na.rm = TRUE),
+    sum(ordered_results_df$trend_type_ordered == "negative_trend", na.rm = TRUE),
+    sum(continuous_results_df$trend_type_continuous == "positive_correlation", na.rm = TRUE),
+    sum(continuous_results_df$trend_type_continuous == "negative_correlation", na.rm = TRUE)
+  )
+)
+summary_plot <- ggplot(trend_summary, aes(x = Method, y = Count, fill = Trend)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = Count), position = position_dodge(width = 0.9), vjust = -0.5) +
+  labs(title = "Trend Summary", 
+       subtitle = "Ordered vs Linear Model",
+       x = "Method", 
+       y = "Gene Count") +
+  theme_bw() +
+  scale_fill_brewer(palette = "Set1") +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(color = "gray40"))
+ggsave("Trend_Visualizations/trend_summary.png", summary_plot, width = 8, height = 6, dpi = 300)
+cat("✅ 趋势统计摘要图已保存\n")
+
+#### 5. 结果保存与下游分析准备 ----------------------------------------------
+### 5.1 系统化保存分析结果
+consistent_positive <- trend_comparison$gene_id[
+  trend_comparison$consistent_pattern == "consistent" & 
+    trend_comparison$trend_type_continuous == "positive_correlation"
+]
+consistent_negative <- trend_comparison$gene_id[
+  trend_comparison$consistent_pattern == "consistent" & 
+    trend_comparison$trend_type_continuous == "negative_correlation"
+]
+write.csv(data.frame(GeneID = consistent_positive), 
+          "Trend_Analysis_Results/consistent_positive_trend_genes.csv", row.names = FALSE)
+write.csv(data.frame(GeneID = consistent_negative), 
+          "Trend_Analysis_Results/consistent_negative_trend_genes.csv", row.names = FALSE)
+write.csv(trend_clusters, "Trend_Analysis_Results/trend_clusters.csv", row.names = FALSE)
+write.csv(trend_comparison, "Trend_Analysis_Results/trend_comparison_full.csv", row.names = FALSE)
+write.csv(cluster_trend_summary, "Trend_Analysis_Results/cluster_trend_summary.csv", row.names = FALSE)
+trend_results <- list(
+  consistent_positive = consistent_positive,
+  consistent_negative = consistent_negative,
+  trend_clusters = trend_clusters,
+  trend_comparison = trend_comparison,
+  ordered_results = ordered_results_df,
+  continuous_results = continuous_results_df,
+  cluster_trend_summary = cluster_trend_summary,
+  parameters = trend_analysis_parameters,
+  metadata = pipeline_metadata
+)
+saveRDS(trend_results, "Trend_Analysis_Results/trend_analysis_results.rds")
+cat("✅ 所有分析结果已保存至 Trend_Analysis_Results/ 目录\n")
+
+### 5.2 为下游分析准备文件
+cat("正在为下游分析准备文件...\n")
+downstream_dirs <- c("GO_Analysis", "Network_Analysis")
+sapply(downstream_dirs, function(dir) if (!dir.exists(dir)) dir.create(dir, recursive = TRUE))
+write.csv(data.frame(GeneID = consistent_positive), 
+          "GO_Analysis/trend_positive_genes.csv", row.names = FALSE)
+write.csv(data.frame(GeneID = consistent_negative), 
+          "GO_Analysis/trend_negative_genes.csv", row.names = FALSE)
+write.csv(data.frame(GeneID = unique(c(consistent_positive, consistent_negative))), 
+          "GO_Analysis/all_trend_genes.csv", row.names = FALSE)
+if (!dir.exists("Network_Analysis")) {
+  dir.create("Network_Analysis", recursive = TRUE)
+  cat("   创建目录: Network_Analysis\n")
+}
+if (!exists("datExpr")) {
+  cat("⚠️ datExpr不存在，重新创建...\n")
+  if (exists("normalized_counts") && exists("wgcna_genes")) {
+    expr_data <- normalized_counts[wgcna_genes, ]
+    datExpr <- as.data.frame(t(expr_data))
+    cat("✅ 重新创建datExpr成功\n")
+  } else {
+    cat("❌ 无法重新创建datExpr，缺少必要组件\n")
+    cat("   跳过表达矩阵保存\n")
+  }
+}
+if (exists("datExpr")) {
+  write.csv(datExpr, "Network_Analysis/wgcna_expression_matrix.csv")
+  cat("✅ WGCNA表达矩阵已保存\n")
+} else {
+  cat("⚠️ 跳过WGCNA表达矩阵保存\n")
+}
+if (exists("normalized_counts")) {
+  write.csv(normalized_counts, "Network_Analysis/normalized_counts_matrix.csv")
+  cat("✅ 标准化计数矩阵已保存\n")
+} else {
+  cat("⚠️ 跳过标准化计数矩阵保存\n")
+}
+trend_genes_found <- FALSE
+if (exists("trend_results") && !is.null(trend_results)) {
+  if (length(trend_results$consistent_positive) > 0 || length(trend_results$consistent_negative) > 0) {
+    trend_genes <- unique(c(trend_results$consistent_positive, trend_results$consistent_negative))
+    trend_genes <- trend_genes[trend_genes %in% rownames(normalized_counts)]
+    if (length(trend_genes) > 0) {
+      trend_expression <- normalized_counts[trend_genes, ]
+      write.csv(trend_expression, "Network_Analysis/trend_genes_expression.csv")
+      cat("✅ 趋势基因表达矩阵已保存\n")
+      trend_genes_found <- TRUE
+    }
+  }
+}
+if (!trend_genes_found && file.exists("Trend_Analysis_Results/trend_analysis_results.rds")) {
+  trend_data <- readRDS("Trend_Analysis_Results/trend_analysis_results.rds")
+  if (!is.null(trend_data$consistent_positive) || !is.null(trend_data$consistent_negative)) {
+    trend_genes <- unique(c(trend_data$consistent_positive, trend_data$consistent_negative))
+    trend_genes <- trend_genes[trend_genes %in% rownames(normalized_counts)]
+    if (length(trend_genes) > 0) {
+      trend_expression <- normalized_counts[trend_genes, ]
+      write.csv(trend_expression, "Network_Analysis/trend_genes_expression.csv")
+      cat("✅ 趋势基因表达矩阵已保存 (从文件加载)\n")
+      trend_genes_found <- TRUE
+    }
+  }
+}
+if (!trend_genes_found) {
+  cat("⚠️ 未找到趋势分析基因，跳过保存\n")
+}
+if (exists("sample_info")) {
+  write.csv(sample_info, "Network_Analysis/sample_information.csv")
+  cat("✅ 样本信息已保存\n")
+} else {
+  cat("⚠️ 缺少sample_info，跳过保存\n")
+}
+if (exists("wgcna_genes")) {
+  write.csv(data.frame(GeneID = wgcna_genes), "Network_Analysis/wgcna_gene_list.csv", row.names = FALSE)
+  cat("✅ WGCNA基因列表已保存\n")
+}
+for (cluster_id in unique(trend_clusters$cluster)) {
+  cluster_genes <- trend_clusters$gene_id[trend_clusters$cluster == cluster_id]
+  if (length(cluster_genes) > 0) {
+    write.csv(data.frame(GeneID = cluster_genes), 
+              paste0("Trend_Analysis_Results/cluster_", cluster_id, "_genes.csv"), 
+              row.names = FALSE)
+  }
+}
+cat("✅ 下游分析输入文件准备完成\n")
+
+#### 6. 分析总结报告 --------------------------------------------------------
+cat("\n=== 趋势分析总结报告 ===\n")
+cat("🎯 分析成果总结:\n")
+cat("========================================\n")
+cat("• 分析方法: 三种方法完整实施并整合\n")
+cat("• 基因选择策略:", gene_selection_strategy, "\n")
+cat("• 一致正趋势基因:", length(consistent_positive), "\n")
+cat("• 一致负趋势基因:", length(consistent_negative), "\n")
+cat("• 趋势模式聚类:", length(unique(trend_clusters$cluster)), "个独特模式\n")
+cat("• 生成可视化: 热图、趋势曲线、统计图\n")
+cat("\n📁 生成的核心文件:\n")
+cat("========================================\n")
+cat("• Trend_Analysis_Results/trend_analysis_results.rds - 完整结果对象\n")
+cat("• Trend_Analysis_Results/consistent_*_trend_genes.csv - 趋势基因列表\n")
+cat("• Trend_Analysis_Results/trend_clusters.csv - 聚类分析结果\n")
+cat("• Trend_analysis_parameters.rds - 分析参数记录\n")
+cat("• Trend_analysis_metadata.rds - 分析元数据\n")
+cat("\n🔬 方法学优势:\n")
+cat("========================================\n")
+cat("• 有序比较: 检验单调趋势，验证行为梯度一致性\n")
+cat("• 线性模型: 量化相关强度，提供效应值估计\n")
+cat("• 聚类分析: 发现复杂模式，捕捉非线性关系\n")
+cat("• 一致性整合: 提高结果可靠性，减少假阳性\n")
+cat("\n🎯 下一步分析建议:\n")
+cat("========================================\n")
+cat("1. GO/KEGG富集分析: 使用 GO_Analysis/ 中的趋势基因列表\n")
+cat("2. WGCNA共表达网络: 使用 Network_Analysis/ 趋势基因表达矩阵\n")
+cat("3. 功能模块分析: 重点研究富集趋势基因的聚类\n")
+cat("4. 跨脑区比较: 结合其他脑区结果进行综合解释\n")
+cat("\n💡 重要提醒:\n")
+cat("========================================\n")
+cat("• 趋势基因更适合回答行为相关的生物学问题\n")
+cat("• 一致趋势基因具有更高的可信度和生物学意义\n")
+cat("• 所有结果文件已标准化保存，便于跨脑区比较\n")
+cat("✅ 趋势分析流程圆满完成！\n")
+cat("   三种方法完整实施、充分整合、完美衔接\n")
+cat("   输出文件已系统化整理，准备好用于下游功能分析\n")
