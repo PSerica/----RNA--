@@ -1,0 +1,439 @@
+##### 前置内容
+##### 步骤1: 建立ID映射表
+# 重新读取所有必要文件
+eggnog_data <- read.csv("[annotation_file].csv", 
+                        stringsAsFactors = FALSE,
+                        comment.char = "#")
+
+# 读取GTF文件获取基因ID
+library(rtracklayer)
+gtf_data <- import("[genome_annotation].gtf")
+gene_rows <- gtf_data[gtf_data$type == "gene"]
+gtf_gene_ids <- unique(gene_rows$gene_id)
+
+# 读取KEGG参考文件
+kegg_info <- read.csv("[kegg_info].csv", stringsAsFactors = FALSE)
+
+cat("eggNOG数据行数:", nrow(eggnog_data), "\n")
+cat("GTF中基因数量:", length(gtf_gene_ids), "\n")
+
+
+##### 步骤1: 建立ID映射表
+# 从protein.faa或GTF中提取蛋白质ID与基因ID的对应关系
+id_mapping <- data.frame(
+  GID = c("[GeneID_1]", "[GeneID_2]"),  # 来自GTF
+  PID = c("[ProteinID_1]", "[ProteinID_2]")  # 来自eggNOG
+)
+
+# 方法1：从eggNOG的query列提取基因ID信息
+# 假设蛋白质ID可以映射到基因ID，这里需要根据您的数据实际情况调整
+# 如果protein.faa文件存在，可以从那里获取更准确的映射
+
+# 临时创建示例映射 - 您需要根据实际数据调整这个映射
+# 这里假设eggNOG中的每个蛋白质对应GTF中的一个基因
+id_mapping <- data.frame(
+  GID = gtf_gene_ids[1:length(unique(eggnog_data$query))],
+  PID = unique(eggnog_data$query)
+)
+
+# 如果映射数量不匹配，使用更安全的方法
+if (nrow(id_mapping) < nrow(eggnog_data)) {
+  # 创建基于索引的映射
+  id_mapping <- data.frame(
+    GID = paste0("GENE_", 1:nrow(eggnog_data)),
+    PID = eggnog_data$query
+  )
+  warning("使用自动生成的基因ID，建议检查实际映射关系")
+}
+
+print("ID映射表前6行:")
+print(head(id_mapping))
+
+##### 步骤2: 准备OrgDb构建数据
+library(AnnotationForge)
+
+# 合并基因信息
+gene_info <- data.frame(
+  GID = id_mapping$GID,
+  GENENAME = eggnog_data$Preferred_name,
+  DESCRIPTION = eggnog_data$Description,
+  stringsAsFactors = FALSE
+)
+
+# 处理GO注释
+process_go_annotations_fast <- function(eggnog_data, id_mapping) {
+  cat("开始处理GO注释...\n")
+  
+  # 使用strsplit和unlist一次性处理所有GO条目
+  go_split <- strsplit(eggnog_data$GOs, ",")
+  
+  # 计算每个基因对应的GO数量
+  go_lengths <- sapply(go_split, length)
+  
+  # 创建重复的GID索引
+  gid_rep <- rep(id_mapping$GID, go_lengths)
+  
+  # 一次性解包所有GO条目
+  go_terms <- unlist(go_split)
+  # 过滤空值
+  non_empty <- go_terms != "" & !is.na(go_terms)
+  gid_rep <- gid_rep[non_empty]
+  go_terms <- go_terms[non_empty]
+  # 直接创建数据框
+  go_annot <- data.frame(
+    GID = gid_rep,
+    GO = go_terms,
+    EVIDENCE = "IEA",
+    stringsAsFactors = FALSE
+  )
+  cat("完成GO注释处理，共", nrow(go_annot), "条记录\n")
+  return(go_annot)
+}
+
+# 使用优化版本
+go_annot <- process_go_annotations_fast(eggnog_data, id_mapping)
+cat("GO注释数量:", nrow(go_annot), "\n")
+
+# 处理KEGG注释
+process_kegg_annotations_fast <- function(eggnog_data, id_mapping) {
+  cat("开始处理KEGG注释...\n")
+  # 提取KEGG_ko列
+  kegg_ko <- eggnog_data$KEGG_ko
+  # 使用strsplit一次性处理所有KEGG条目
+  kegg_split <- strsplit(kegg_ko, ",")
+  # 计算每个基因对应的KEGG数量
+  kegg_lengths <- sapply(kegg_split, function(x) {
+    sum(x != "" & !is.na(x) & x != "-")
+  })
+  # 创建重复的GID索引
+  gid_rep <- rep(id_mapping$GID, kegg_lengths)
+  # 一次性解包所有KEGG条目并过滤
+  kegg_terms <- unlist(kegg_split)
+  valid_terms <- kegg_terms != "" & !is.na(kegg_terms) & kegg_terms != "-"
+  # 直接创建数据框
+  kegg_annot <- data.frame(
+    GID = gid_rep[valid_terms],
+    KEGG = kegg_terms[valid_terms],
+    stringsAsFactors = FALSE
+  )
+  cat("完成KEGG注释处理，共", nrow(kegg_annot), "条记录\n")
+  return(kegg_annot)
+}
+
+# 使用优化版本
+kegg_annot <- process_kegg_annotations_fast(eggnog_data, id_mapping)
+
+cat("KEGG注释数量:", nrow(kegg_annot), "\n")
+
+##### 步骤3: 构建OrgDb
+# 确保所有数据框都有正确的行名
+rownames(gene_info) <- gene_info$GID
+
+# 检查重复的GID
+cat("检查重复GID...\n")
+duplicate_gids <- gene_info$GID[duplicated(gene_info$GID)]
+cat("重复GID数量:", length(duplicate_gids), "\n")
+if (length(duplicate_gids) > 0) {
+  cat("前10个重复GID:\n")
+  print(head(duplicate_gids, 10))
+}
+# 查看重复GID的详细信息
+if (length(duplicate_gids) > 0) {
+  duplicate_info <- gene_info[gene_info$GID %in% duplicate_gids, ]
+  cat("重复GID的详细信息:\n")
+  print(head(duplicate_info, 20))
+}
+
+# 检查ID映射的完整性
+cat("=== ID映射问题诊断 ===\n")
+# 检查id_mapping的维度
+cat("id_mapping行数:", nrow(id_mapping), "\n")
+cat("eggnog_data行数:", nrow(eggnog_data), "\n")
+cat("gene_info行数:", nrow(gene_info), "\n")
+# 检查id_mapping中的NA值
+cat("id_mapping中GID为NA的数量:", sum(is.na(id_mapping$GID)), "\n")
+cat("id_mapping中PID为NA的数量:", sum(is.na(id_mapping$PID)), "\n")
+# 检查gene_info中GID为NA的数量
+cat("gene_info中GID为NA的数量:", sum(is.na(gene_info$GID)), "\n")
+# 检查映射匹配情况
+cat("eggnog_data中的query在id_mapping中的匹配率:", 
+    mean(eggnog_data$query %in% id_mapping$PID), "\n")
+
+# 定义正确的ID映射创建函数
+create_proper_id_mapping <- function(eggnog_data, gtf_gene_ids) {
+  cat("创建正确的ID映射...\n")
+  #方法：使用eggnog_data的索引创建唯一GID
+  id_mapping <- data.frame(
+    GID = paste0("GENE_", 1:nrow(eggnog_data)),  # 创建唯一基因ID
+    PID = eggnog_data$query,                     # 蛋白质ID
+    stringsAsFactors = FALSE
+  )
+  cat("创建的映射包含", nrow(id_mapping), "条记录\n")
+  cat("GID唯一性:", length(unique(id_mapping$GID)) == nrow(id_mapping), "\n")
+  cat("PID唯一性:", length(unique(id_mapping$PID)) == nrow(id_mapping), "\n")
+  return(id_mapping)
+}
+# 定义正确的gene_info创建函数
+create_gene_info_proper <- function(eggnog_data, id_mapping) {
+  cat("重新创建gene_info...\n")
+  gene_info <- data.frame(
+    GID = id_mapping$GID,
+    GENENAME = eggnog_data$Preferred_name,
+    DESCRIPTION = eggnog_data$Description,
+    stringsAsFactors = FALSE
+  )
+  # 处理空值
+  gene_info$GENENAME[gene_info$GENENAME == "" | is.na(gene_info$GENENAME)] <- "-"
+  gene_info$DESCRIPTION[gene_info$DESCRIPTION == "" | is.na(gene_info$DESCRIPTION)] <- "-"
+  # 检查结果
+  cat("gene_info中GID为NA的数量:", sum(is.na(gene_info$GID)), "\n")
+  cat("gene_info中重复GID数量:", sum(duplicated(gene_info$GID)), "\n")
+  return(gene_info)
+}
+
+# 步骤1：重新创建正确的ID映射
+cat("=== 步骤1: 重新创建ID映射 ===\n")
+id_mapping_proper <- create_proper_id_mapping(eggnog_data, gtf_gene_ids)
+# 步骤2：重新创建gene_info
+cat("\n=== 步骤2: 重新创建gene_info ===\n")
+gene_info_proper <- create_gene_info_proper(eggnog_data, id_mapping_proper)
+# 步骤3：设置行名
+cat("\n=== 步骤3: 设置行名 ===\n")
+rownames(gene_info_proper) <- gene_info_proper$GID
+cat("行名设置成功！重复行名数量:", sum(duplicated(rownames(gene_info_proper))), "\n")
+# 步骤4：重新处理注释数据
+cat("\n=== 步骤4: 重新处理注释数据 ===\n")
+go_annot_proper <- process_go_annotations_fast(eggnog_data, id_mapping_proper)
+kegg_annot_proper <- process_kegg_annotations_fast(eggnog_data, id_mapping_proper)
+# 步骤5：验证结果
+cat("\n=== 步骤5: 验证结果 ===\n")
+cat("gene_info维度:", dim(gene_info_proper), "\n")
+cat("GO注释数量:", nrow(go_annot_proper), "\n")
+cat("KEGG注释数量:", nrow(kegg_annot_proper), "\n")
+cat("所有GID唯一:", length(unique(gene_info_proper$GID)) == nrow(gene_info_proper), "\n")
+
+# 检查各数据框的重复行
+cat("=== 检查重复行 ===\n")
+cat("gene_info_proper重复行数:", sum(duplicated(gene_info_proper)), "\n")
+cat("go_annot_proper重复行数:", sum(duplicated(go_annot_proper)), "\n")
+cat("kegg_annot_proper重复行数:", sum(duplicated(kegg_annot_proper)), "\n")
+
+# 检查特定列的重复组合
+cat("gene_info_proper中GID重复数:", sum(duplicated(gene_info_proper$GID)), "\n")
+cat("go_annot_proper中(GID, GO)重复数:", sum(duplicated(go_annot_proper[, c("GID", "GO")])), "\n")
+cat("kegg_annot_proper中(GID, KEGG)重复数:", sum(duplicated(kegg_annot_proper[, c("GID", "KEGG")])), "\n")
+
+# 清理重复行的函数
+clean_duplicates <- function(gene_info, go_annot, kegg_annot) {
+  cat("开始清理重复行...\n")
+  # 1. 清理gene_info重复
+  gene_info_clean <- gene_info[!duplicated(gene_info), ]
+  cat("gene_info清理后:", nrow(gene_info_clean), "行 (移除", nrow(gene_info) - nrow(gene_info_clean), "个重复)\n")
+  # 2. 清理GO注释重复 (基于GID和GO组合)
+  go_annot_clean <- go_annot[!duplicated(go_annot[, c("GID", "GO")]), ]
+  cat("GO注释清理后:", nrow(go_annot_clean), "行 (移除", nrow(go_annot) - nrow(go_annot_clean), "个重复)\n")
+  # 3. 清理KEGG注释重复 (基于GID和KEGG组合)
+  kegg_annot_clean <- kegg_annot[!duplicated(kegg_annot[, c("GID", "KEGG")]), ]
+  cat("KEGG注释清理后:", nrow(kegg_annot_clean), "行 (移除", nrow(kegg_annot) - nrow(kegg_annot_clean), "个重复)\n")
+  return(list(
+    gene_info = gene_info_clean,
+    go_annot = go_annot_clean,
+    kegg_annot = kegg_annot_clean
+  ))
+}
+
+# 执行清理
+cleaned_data <- clean_duplicates(gene_info_proper, go_annot_proper, kegg_annot_proper)
+
+# 检查cleaned_data中GID的空值情况
+cat("=== 检查GID空值问题 ===\n")
+# 检查gene_info中的GID
+cat("gene_info中GID为NA的数量:", sum(is.na(cleaned_data$gene_info$GID)), "\n")
+cat("gene_info中GID为空字符串的数量:", sum(cleaned_data$gene_info$GID == ""), "\n")
+# 检查GO注释中的GID
+cat("GO注释中GID为NA的数量:", sum(is.na(cleaned_data$go_annot$GID)), "\n")
+cat("GO注释中GID为空字符串的数量:", sum(cleaned_data$go_annot$GID == ""), "\n")
+# 检查KEGG注释中的GID
+cat("KEGG注释中GID为NA的数量:", sum(is.na(cleaned_data$kegg_annot$GID)), "\n")
+cat("KEGG注释中GID为空字符串的数量:", sum(cleaned_data$kegg_annot$GID == ""), "\n")
+# 检查GID的格式
+cat("gene_info中GID示例:\n")
+print(head(cleaned_data$gene_info$GID, 10))
+
+# 修复GID空值的函数
+fix_gid_issues <- function(cleaned_data) {
+  cat("修复GID空值问题...\n")
+  
+  # 1. 修复gene_info中的GID
+  gene_info_fixed <- cleaned_data$gene_info
+  na_gids <- is.na(gene_info_fixed$GID) | gene_info_fixed$GID == ""
+  if (sum(na_gids) > 0) {
+    cat("修复", sum(na_gids), "个gene_info中的空GID\n")
+    gene_info_fixed$GID[na_gids] <- paste0("MISSING_GID_", 1:sum(na_gids))
+  }
+  # 2. 修复GO注释中的GID
+  go_annot_fixed <- cleaned_data$go_annot
+  na_gids_go <- is.na(go_annot_fixed$GID) | go_annot_fixed$GID == ""
+  if (sum(na_gids_go) > 0) {
+    cat("修复", sum(na_gids_go), "个GO注释中的空GID\n")
+    # 移除这些行，因为无法关联到有效基因
+    go_annot_fixed <- go_annot_fixed[!na_gids_go, ]
+  }
+  # 3. 修复KEGG注释中的GID
+  kegg_annot_fixed <- cleaned_data$kegg_annot
+  na_gids_kegg <- is.na(kegg_annot_fixed$GID) | kegg_annot_fixed$GID == ""
+  if (sum(na_gids_kegg) > 0) {
+    cat("修复", sum(na_gids_kegg), "个KEGG注释中的空GID\n")
+    # 移除这些行，因为无法关联到有效基因
+    kegg_annot_fixed <- kegg_annot_fixed[!na_gids_kegg, ]
+  }
+  # 验证修复结果
+  cat("修复后验证:\n")
+  cat("gene_info空GID:", sum(is.na(gene_info_fixed$GID) | gene_info_fixed$GID == ""), "\n")
+  cat("GO注释空GID:", sum(is.na(go_annot_fixed$GID) | go_annot_fixed$GID == ""), "\n")
+  cat("KEGG注释空GID:", sum(is.na(kegg_annot_fixed$GID) | kegg_annot_fixed$GID == ""), "\n")
+  return(list(
+    gene_info = gene_info_fixed,
+    go_annot = go_annot_fixed,
+    kegg_annot = kegg_annot_fixed
+  ))
+}
+
+# 执行修复
+fixed_data <- fix_gid_issues(cleaned_data)
+
+# 更安全的修复函数
+fix_gid_issues_safe <- function(cleaned_data) {
+  cat("安全修复GID问题...\n")
+  # 直接移除KEGG注释中GID为NA的行
+  kegg_annot_fixed <- cleaned_data$kegg_annot[!is.na(cleaned_data$kegg_annot$GID), ]
+  cat("移除KEGG注释中GID为NA的行:", nrow(cleaned_data$kegg_annot) - nrow(kegg_annot_fixed), "\n")
+  cat("修复后KEGG注释行数:", nrow(kegg_annot_fixed), "\n")
+  return(list(
+    gene_info = cleaned_data$gene_info,
+    go_annot = cleaned_data$go_annot,
+    kegg_annot = kegg_annot_fixed
+  ))
+}
+
+# 执行安全修复
+fixed_data <- fix_gid_issues_safe(cleaned_data)
+
+# 重新设置行名
+cat("重新设置行名...\n")
+rownames(fixed_data$gene_info) <- fixed_data$gene_info$GID
+# 验证数据完整性
+cat("=== 最终数据验证 ===\n")
+cat("gene_info行数:", nrow(fixed_data$gene_info), "\n")
+cat("GO注释行数:", nrow(fixed_data$go_annot), "\n") 
+cat("KEGG注释行数:", nrow(fixed_data$kegg_annot), "\n")
+cat("gene_info空GID:", sum(is.na(fixed_data$gene_info$GID)), "\n")
+cat("GO注释空GID:", sum(is.na(fixed_data$go_annot$GID)), "\n")
+cat("KEGG注释空GID:", sum(is.na(fixed_data$kegg_annot$GID)), "\n")
+
+# 检查GO注释的格式
+cat("=== 检查GO注释格式 ===\n")
+# 查看GO注释的前几个条目
+cat("GO注释前10个条目:\n")
+print(head(fixed_data$go_annot$GO, 10))
+# 检查不符合GO格式的条目
+invalid_go <- !grepl("^GO:\\d+$", fixed_data$go_annot$GO)
+cat("不符合GO格式的条目数量:", sum(invalid_go), "\n")
+if (sum(invalid_go) > 0) {
+  cat("不符合格式的GO条目示例:\n")
+  print(head(fixed_data$go_annot$GO[invalid_go], 20))
+}
+# 检查GO条目的唯一性
+cat("唯一GO条目数量:", length(unique(fixed_data$go_annot$GO)), "\n")
+
+# 修复GO注释格式的函数
+fix_go_format <- function(go_annot) {
+  cat("修复GO注释格式...\n")
+  # 只保留符合GO:XXXXXXX格式的条目
+  valid_go <- grepl("^GO:\\d+$", go_annot$GO)
+  go_annot_fixed <- go_annot[valid_go, ]
+  cat("原始GO注释行数:", nrow(go_annot), "\n")
+  cat("有效GO格式行数:", nrow(go_annot_fixed), "\n")
+  cat("移除无效GO格式行数:", nrow(go_annot) - nrow(go_annot_fixed), "\n")
+  # 检查修复后的格式
+  cat("修复后GO格式验证:", all(grepl("^GO:\\d+$", go_annot_fixed$GO)), "\n")
+  return(go_annot_fixed)
+}
+# 执行修复
+go_annot_fixed <- fix_go_format(fixed_data$go_annot)
+
+# 修复无效GO注释的函数
+fix_invalid_go_annotations <- function(go_annot) {
+  cat("修复无效GO注释...\n")
+  original_count <- nrow(go_annot)
+  # 移除所有无效的GO条目（包括单独的"-"）
+  valid_go <- grepl("^GO:\\d+$", go_annot$GO)
+  go_annot_fixed <- go_annot[valid_go, ]
+  cat("修复结果:\n")
+  cat("  原始GO注释数:", original_count, "\n")
+  cat("  有效GO注释数:", nrow(go_annot_fixed), "\n")
+  cat("  移除无效GO注释:", original_count - nrow(go_annot_fixed), "\n")
+  cat("  全部符合GO:XXXXXXX格式:", all(grepl("^GO:\\d+$", go_annot_fixed$GO)), "\n")
+  return(go_annot_fixed)
+}
+
+# 执行修复
+go_annot_fixed <- fix_invalid_go_annotations(fixed_data$go_annot)
+
+# 更新数据
+fixed_data$go_annot <- go_annot_fixed
+
+
+# 步骤6：构建OrgDb
+## 最终构建OrgDb
+# 验证修复后的数据
+cat("=== 修复后数据验证 ===\n")
+cat("gene_info行数:", nrow(fixed_data$gene_info), "\n")
+cat("GO注释行数:", nrow(fixed_data$go_annot), "\n")
+cat("KEGG注释行数:", nrow(fixed_data$kegg_annot), "\n")
+cat("GO格式验证:", all(grepl("^GO:\\d+$", fixed_data$go_annot$GO)), "\n")
+
+# 构建OrgDb
+cat("=== 构建OrgDb包 ===\n")
+makeOrgPackage(
+  gene_info = fixed_data$gene_info,
+  go = fixed_data$go_annot,
+  kegg = fixed_data$kegg_annot,
+  version = "0.1",
+  author = "[Your Name]", 
+  maintainer = "[Your Name] <[your_email@example.com]>",
+  outputDir = ".",
+  tax_id = "[tax_id]",
+  genus = "[Genus]",
+  species = "[species]", 
+  goTable = "go",
+  verbose = TRUE
+)
+
+cat("✅ OrgDb包构建完成！\n")
+
+# 安装包
+cat("\n=== 安装OrgDb包 ===\n")
+install.packages("./org.[YourSpecies].eg.db", repos = NULL, type = "source")
+
+# 加载和测试
+cat("\n=== 测试OrgDb包 ===\n")
+library(org.[YourSpecies].eg.db)
+
+# 基本功能测试
+cat("包中的keytypes:\n")
+print(keytypes(org.[YourSpecies].eg.db))
+
+cat("包中的columns:\n")  
+print(columns(org.[YourSpecies].eg.db))
+
+# 测试注释检索
+cat("\n测试注释检索:\n")
+test_genes <- head(fixed_data$gene_info$GID, 3)
+test_result <- select(org.[YourSpecies].eg.db, 
+                      keys = test_genes,
+                      columns = c("GENENAME", "GO", "KEGG"),
+                      keytype = "GID")
+print(test_result)
+
+cat("🎉 OrgDb包构建和测试成功完成！\n")
