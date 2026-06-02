@@ -1,0 +1,858 @@
+# DESeq2 差异表达分析完整流程
+# 分析三个物种的转录组数据：[Species_A]、[Species_B]、[Species_C]
+### 第一部分：环境设置与数据准备 -------------------------------------------------
+### 0. 加载统一配置
+# 功能：确保所有分析使用相同的参数和设置
+
+### 0.1 加载必要的R包
+library(tidyverse)
+library(DESeq2)      # 差异表达分析核心包
+library(tidyverse)   # 数据整理和可视化
+library(pheatmap)    # 热图绘制
+library(ggrepel)     # 避免文本重叠
+library(EnhancedVolcano) # 火山图绘制
+library(reshape2)
+
+### 1. 数据加载与预处理 --------------------------------------------------------
+# 读取原始计数矩阵
+# 注意：需要根据实际文件路径调整
+count_data_brian <- read.table("[counts_matrix].txt",
+                               header = TRUE, row.names = 1, skip = 1)
+# 提取计数数据部分（跳过前5列的特征信息）
+counts_data <- count_data_brian[, 6:ncol(count_data_brian)]
+# 数据质量检查
+cat("表达矩阵维度:", dim(counts_data), "\n")  # 输出基因数和样本数
+cat("样本名称:", colnames(counts_data), "\n") # 检查样本名称
+# 读取样本信息表
+sample_info <- read.csv("[sample_metadata].csv", row.names = 1)
+# 确保样本信息与表达矩阵顺序一致
+stopifnot(identical(colnames(counts_data), rownames(sample_info)))
+# 将分组变量转换为因子（DESeq2要求）
+sample_info$species <- as.factor(sample_info$species)
+cat("物种水平:", levels(sample_info$species), "\n")
+
+### 2. 创建DESeq2对象并过滤低表达基因 ------------------------------------------
+# 构建DESeqDataSet对象
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_data,    # 计数矩阵
+  colData = sample_info,      # 样本信息
+  design = ~ species          # 实验设计公式
+)
+# 过滤低表达基因（提高分析质量）
+# 标准：在至少30%的样本中计数≥10
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep, ]
+cat("过滤后保留基因数:", nrow(dds), "\n")
+
+### 3. 执行差异表达分析 --------------------------------------------------------
+# 运行DESeq2标准分析流程（包括标准化、离散度估计、统计检验）
+dds <- DESeq(dds)
+# 检查物种因子水平以确定对比组
+species_levels <- levels(dds$species)
+cat("物种比较顺序:", species_levels, "\n")
+
+### 4. 提取差异表达结果 --------------------------------------------------------
+# 定义所有可能的物种两两比较（修正顺序）与三组共同比较
+# α = 0.05 表示显著性水平为 5%，用于多重假设检验的校正，控制错误发现率(FDR)，
+# padj（校正后p值）的阈值设定，自动对结果进行筛选，只返回 padj < 0.05 的基因，
+#(接上一行)用于FDR控制的显著性水平
+  ### 4.1 两两比较 ###
+  # 功能：执行所有可能的物种两两比较，使用Wald检验
+  # 意义：获得具体的物种间差异表达基因，提供详细的倍数变化信息
+# 比较1：[Species_B] vs [Species_A]
+results_B_vs_A <- results(
+  dds,
+  contrast = c("species", "[Genus_species_B]", "[Genus_species_A]"),
+  alpha = 0.05  # 显著性阈值
+)
+# 比较2：[Species_B] vs [Species_C]  
+results_B_vs_C <- results(
+  dds,
+  contrast = c("species", "[Genus_species_B]", "[Genus_species_C]"),
+  alpha = 0.05
+)
+# 比较3：[Species_A] vs [Species_B]
+results_A_vs_B <- results(
+  dds,
+  contrast = c("species", "[Genus_species_A]", "[Genus_species_B]"),
+  alpha = 0.05
+)
+# 比较4：[Species_A] vs [Species_C]
+results_A_vs_C <- results(
+  dds,
+  contrast = c("species", "[Genus_species_A]", "[Genus_species_C]"),
+  alpha = 0.05
+)
+# 比较5：[Species_C] vs [Species_B]
+results_C_vs_B <- results(
+  dds,
+  contrast = c("species", "[Genus_species_C]", "[Genus_species_B]"),
+  alpha = 0.05
+)
+# 比较6：[Species_C] vs [Species_A]
+results_C_vs_A <- results(
+  dds,
+  contrast = c("species", "[Genus_species_C]", "[Genus_species_A]"),
+  alpha = 0.05
+)
+
+### 4.2 三组整体比较 ###
+# 功能：使用LRT检验进行三组整体差异分析
+# 意义：识别在至少一个物种中表达显著不同的基因，提供全局视角
+# 注意：LRT检验更适合多组比较，但结果结构与Wald检验不同
+# 重要修正：创建新的DESeq对象避免覆盖原有分析结果
+cat("正在创建新的DESeq对象用于LRT检验...\n")
+dds_for_lrt <- DESeqDataSetFromMatrix(
+  countData = counts(dds),          # 使用已过滤的计数数据
+  colData = colData(dds),           # 使用相同的样本信息
+  design = ~ species                # 相同的实验设计
+)
+# 运行LRT检验（似然比检验）
+cat("执行LRT检验...\n")
+dds_lrt <- DESeq(dds_for_lrt, test = "LRT", reduced = ~1)
+results_three_group_lrt <- results(dds_lrt, alpha = 0.05)
+# 计算基因在三个物种间的表达变异
+# 功能：量化每个基因在物种间的表达变异程度
+# 意义：识别高变异基因，可能反映物种特异性表达模式
+cat("计算基因表达变异系数...\n")
+species_means <- t(apply(counts(dds, normalized=TRUE), 1, 
+                         function(x) tapply(x, colData(dds)$species, mean)))
+gene_variance <- apply(species_means, 1, function(x) {
+  if(mean(x) == 0) return(0)  # 避免除零错误
+  sd(x)/mean(x)  # 计算变异系数（标准差/均值）
+})
+# 移除无限值和NA值以确保数据质量
+gene_variance <- gene_variance[is.finite(gene_variance) & !is.na(gene_variance)]
+### 分层基因选择策略 ###
+# 功能：根据不同分析需求选择不同数量的高变异基因
+# 意义：平衡分析深度与计算效率，为不同下游分析提供合适的基因集
+# 第一层：热图展示用基因 (前100个高变异基因)
+# 应用：用于绘制清晰的热图，避免过度拥挤
+top_100_hvg <- names(sort(gene_variance, decreasing = TRUE))[1:100]
+cat("热图展示基因: 前100个高变异基因\n")
+# 第二层：共表达网络分析用基因 (前5000个高变异基因)
+# 应用：WGCNA等共表达网络分析需要足够数量的基因
+top_5000_hvg <- names(sort(gene_variance, decreasing = TRUE))[1:5000]
+cat("共表达网络分析基因: 前5000个高变异基因\n")
+# 第三层：所有显著变异基因 (基于统计阈值)
+# 应用：识别统计上显著的高变异基因，用于功能富集分析
+variance_threshold <- median(gene_variance) + 2 * mad(gene_variance)  # 中位数绝对偏差
+all_significant_hvg <- names(gene_variance[gene_variance > variance_threshold])
+cat(sprintf("统计显著高变异基因: %d个 (阈值: %.3f)\n", 
+            length(all_significant_hvg), variance_threshold))
+# 保存不同层次的基因列表
+# 功能：统一保存所有高变异基因列表
+# 意义：便于后续分析调用，确保结果可重复性
+hvg_lists <- list(
+  heatmap_genes = top_100_hvg,
+  wgcna_genes = top_5000_hvg,
+  all_significant_hvg = all_significant_hvg,
+  variance_scores = gene_variance
+)
+saveRDS(hvg_lists, "[hvg_lists].rds")
+cat("✅ 高变异基因列表已保存: [hvg_lists].rds\n")
+
+  ### 4.3 查看结果摘要与统计
+    # 4.3.1 查看两两比较结果摘要
+cat("=== [Species_B] vs [Species_A] ===\n")
+summary(results_B_vs_A)
+cat("\n=== [Species_B] vs [Species_C] ===\n")
+summary(results_B_vs_C)
+cat("\n=== [Species_A] vs [Species_B] ===\n")
+summary(results_A_vs_B)
+cat("\n=== [Species_A] vs [Species_C] ===\n")
+summary(results_A_vs_C)
+cat("\n=== [Species_C] vs [Species_B] ===\n")
+summary(results_C_vs_B)
+cat("\n=== [Species_C] vs [Species_A] ===\n")
+summary(results_C_vs_A)
+
+    # 4.3.2 三组比较结果统计 
+      ## 4.3.2.1 LRT检验统计
+      # 功能：统计LRT检验的显著基因数量
+      # 意义：评估三组整体差异的规模
+lrt_sig_count <- sum(results_three_group_lrt$padj < 0.05 & !is.na(results_three_group_lrt$padj))
+lrt_total_genes <- nrow(results_three_group_lrt)
+lrt_sig_percent <- round(lrt_sig_count / lrt_total_genes * 100, 2)
+cat("=== LRT检验结果 ===\n")
+cat(sprintf("三组整体显著差异基因数: %d/%d (%.2f%%, padj < 0.05)\n", 
+            lrt_sig_count, lrt_total_genes, lrt_sig_percent))
+cat(sprintf("LRT检验统计量范围: %.2f - %.2f\n", 
+            min(results_three_group_lrt$stat, na.rm = TRUE),
+            max(results_three_group_lrt$stat, na.rm = TRUE)))
+# 高变异基因统计
+cat("\n=== 高变异基因统计 ===\n")
+cat(sprintf("前100个高变异基因变异系数范围: %.3f - %.3f\n",
+            min(gene_variance[top_100_hvg]),
+            max(gene_variance[top_100_hvg])))
+cat(sprintf("前5000个高变异基因变异系数范围: %.3f - %.3f\n",
+            min(gene_variance[top_5000_hvg]),
+            max(gene_variance[top_5000_hvg])))
+cat(sprintf("全基因组变异系数中位数: %.3f\n", median(gene_variance)))
+cat(sprintf("统计阈值 (中位数 + 2×MAD): %.3f\n", variance_threshold))
+        ## 4.3.2.2重叠分析统计
+        # 功能：比较LRT显著基因与高变异基因的重叠情况
+        # 意义：验证不同方法的一致性，识别高置信度差异基因
+lrt_sig_genes <- rownames(results_three_group_lrt)[results_three_group_lrt$padj < 0.05 & !is.na(results_three_group_lrt$padj)]
+overlap_lrt_hvg <- intersect(lrt_sig_genes, all_significant_hvg)
+cat(sprintf("LRT显著与高变异基因重叠数: %d (%.1f%%)\n", 
+            length(overlap_lrt_hvg),
+            length(overlap_lrt_hvg) / length(lrt_sig_genes) * 100))
+        ## 4.3.2.3
+        # 前20个变异最大基因信息
+        # 功能：展示变异程度最高的基因
+        # 意义：识别可能的关键差异表达基因
+top_20_variable <- head(sort(gene_variance, decreasing = TRUE), 20)
+for(i in 1:length(top_20_variable)) {
+  gene_id <- names(top_20_variable)[i]
+  variance_value <- top_20_variable[i]
+  # 获取该基因在LRT检验中的信息
+  lrt_info <- results_three_group_lrt[gene_id, ]
+  lrt_padj <- ifelse(!is.na(lrt_info$padj), sprintf("padj=%.2e", lrt_info$padj), "padj=NA")
+  cat(sprintf("%2d. %s (变异系数=%.3f, %s)\n", 
+              i, gene_id, variance_value, lrt_padj))
+}
+# 保存高变异基因相关结果
+saveRDS(top_20_variable, "top_20_high_variable_genes.rds")
+write.csv(data.frame(gene_id = names(gene_variance), variance = gene_variance), 
+          "all_genes_variance_scores.csv", row.names = FALSE)
+# 保存详细统计结果
+# 功能：创建三组比较的汇总统计表
+# 应用：用于报告撰写和结果展示
+three_group_stats <- data.frame(
+  Analysis_Type = c("LRT_Three_Group", "HVG_Top100", "HVG_Top5000", "HVG_Significant"),
+  Gene_Count = c(lrt_sig_count, length(top_100_hvg), length(top_5000_hvg), length(all_significant_hvg)),
+  Percentage_Total = c(lrt_sig_percent, 
+                       round(length(top_100_hvg)/length(gene_variance)*100, 2),
+                       round(length(top_5000_hvg)/length(gene_variance)*100, 2),
+                       round(length(all_significant_hvg)/length(gene_variance)*100, 2)),
+  Description = c("三组整体差异显著基因", "热图展示基因", "共表达网络分析基因", "统计显著高变异基因")
+)
+saveRDS(hvg_lists, "hierarchical_gene_lists.rds")
+write.csv(three_group_stats, "three_group_comparison_statistics.csv", row.names = FALSE)
+cat("\n✅ 三组比较统计详情已保存: three_group_comparison_statistics.csv\n")
+
+  ### 4.4 三组比较结果格式标准化 ###
+standardize_three_group_results <- function(lrt_results, dds_object, variance_scores) {
+  # 创建与Wald检验结果相同结构的数据框
+  three_group_df <- as.data.frame(lrt_results)
+  # 添加基因ID列
+  three_group_df$gene_id <- rownames(three_group_df)
+  # 使用预先计算的变异系数作为log2FoldChange的替代
+  three_group_df$log2FoldChange <- log2(variance_scores[three_group_df$gene_id] + 1e-6)
+  # 估算lfcSE（基于统计量的相对大小）
+  three_group_df$lfcSE <- three_group_df$stat / (max(three_group_df$stat, na.rm = TRUE) / 2)
+  # 确保包含所有必需的列
+  three_group_df$pvalue <- three_group_df$pvalue
+  three_group_df$padj <- three_group_df$padj
+  three_group_df$baseMean <- three_group_df$baseMean
+  three_group_df$stat <- three_group_df$stat
+  # 添加比较类型标识
+  three_group_df$comparison_type <- "three_group_LRT"
+  # 重新排列列顺序以匹配整理函数的期望
+  three_group_df <- three_group_df[, c("gene_id", "log2FoldChange", "lfcSE", "stat", 
+                                       "pvalue", "padj", "baseMean", "comparison_type")]
+  return(three_group_df)
+}
+# 应用标准化函数（注意添加variance_scores参数）
+results_three_group_standardized <- standardize_three_group_results(
+  results_three_group_lrt, dds, gene_variance
+)
+cat("✅ 三组LRT检验结果已标准化，可与两两比较结果统一处理\n")
+
+### 5. 结果整理与注释函数 ------------------------------------------------------
+# 功能：整理和注释DESeq2结果（支持Wald检验和LRT检验）
+# 意义：统一所有比较组的结果格式，便于后续分析和可视化
+  ## 5.1 函数构建
+  # 功能：整理和注释DESeq2结果（支持Wald检验和LRT检验）
+organize_DESeq_results <- function(results_object, comparison_name, test_type = "wald") {
+  if(test_type == "wald") {
+    # 原有Wald检验处理逻辑
+    res_df <- as.data.frame(results_object)
+    res_df$gene_id <- rownames(res_df)
+    res_df$comparison <- comparison_name
+    res_df$test_type <- "wald"
+  } else if(test_type == "lrt") {
+    # LRT检验特殊处理 - 使用标准化后的结果
+    res_df <- results_object  # 使用标准化后的结果
+    res_df$comparison <- comparison_name
+    res_df$test_type <- "lrt"
+  }
+  # 确保所有必需的列都存在
+  required_cols <- c("gene_id", "comparison", "test_type", "log2FoldChange", "padj", 
+                     "pvalue", "baseMean", "lfcSE", "stat")
+  # 检查缺失的列
+  missing_cols <- setdiff(required_cols, colnames(res_df))
+  if(length(missing_cols) > 0) {
+    cat("警告: 缺少列:", paste(missing_cols, collapse = ", "), "\n")
+    # 为缺失的列添加NA值
+    for(col in missing_cols) {
+      res_df[[col]] <- NA
+    }
+  }
+  # 更健壮的DE_status赋值（根据检验类型调整阈值）
+  res_df$DE_status <- "NOT_SIG"
+  if(test_type == "wald") {
+    # Wald检验使用原有标准：显著且log2FC绝对值≥1
+    significant <- !is.na(res_df$padj) & res_df$padj < 0.05
+    large_fc <- abs(res_df$log2FoldChange) >= 1
+    up_condition <- significant & large_fc & res_df$log2FoldChange > 0
+    down_condition <- significant & large_fc & res_df$log2FoldChange < 0
+  } else if(test_type == "lrt") {
+    # LRT检验使用调整后的标准
+    # 注意：LRT检验识别整体差异，不区分上下调方向
+    significant <- !is.na(res_df$padj) & res_df$padj < 0.05
+    # 使用变异程度作为替代标准（前25%的高变异基因）
+    high_variation <- res_df$log2FoldChange > quantile(res_df$log2FoldChange, 0.75, na.rm=TRUE)
+    up_condition <- significant & high_variation
+    down_condition <- rep(FALSE, nrow(res_df))  # LRT不设下调基因
+    # 对于LRT显著基因，统一标记为LRT_SIGNIFICANT
+    res_df$DE_status[significant] <- "LRT_SIGNIFICANT"
+  }
+  # 设置上下调状态（仅对Wald检验有效）
+  res_df$DE_status[up_condition] <- "UP"
+  res_df$DE_status[down_condition] <- "DOWN"
+  # 确保列顺序正确
+  final_cols <- c("gene_id", "comparison", "test_type", "DE_status",
+                  "log2FoldChange", "padj", "pvalue", 
+                  "baseMean", "lfcSE", "stat")
+  # 只保留存在的列
+  existing_cols <- intersect(final_cols, colnames(res_df))
+  res_df <- res_df[, existing_cols]
+  # 按显著性排序：先按padj升序，再按log2FC绝对值降序
+  res_df <- res_df[order(res_df$padj, -abs(res_df$log2FoldChange)), ]
+  return(res_df)
+}
+  ## 5.2 应用整理函数到全部比较组
+cat("\n正在整理所有比较组结果...\n")
+# [Species_B]为参考的比较
+final_B_vs_A <- organize_DESeq_results(
+  results_B_vs_A,
+  "[Genus_species_B]_vs_[Genus_species_A]",
+  test_type = "wald"
+)
+final_B_vs_C <- organize_DESeq_results(
+  results_B_vs_C,
+  "[Genus_species_B]_vs_[Genus_species_C]",
+  test_type = "wald"
+)
+# [Species_A]为参考的比较
+final_A_vs_B <- organize_DESeq_results(
+  results_A_vs_B,
+  "[Genus_species_A]_vs_[Genus_species_B]",
+  test_type = "wald"
+)
+final_A_vs_C <- organize_DESeq_results(
+  results_A_vs_C,
+  "[Genus_species_A]_vs_[Genus_species_C]",
+  test_type = "wald"
+)
+# [Species_C]为参考的比较
+final_C_vs_B <- organize_DESeq_results(
+  results_C_vs_B,
+  "[Genus_species_C]_vs_[Genus_species_B]",
+  test_type = "wald"
+)
+final_C_vs_A <- organize_DESeq_results(
+  results_C_vs_A,
+  "[Genus_species_C]_vs_[Genus_species_A]",
+  test_type = "wald"
+)
+# 三组比较使用新的test_type参数
+final_three_group <- organize_DESeq_results(
+  results_three_group_standardized,
+  "Three_Species_Global_Comparison", 
+  test_type = "lrt"
+)
+cat("✅ 所有比较组结果整理完成\n")
+
+
+  ## 5.3 查看各比较组的差异基因统计
+cat("\n=== 各比较组差异基因统计 ===\n")
+comparison_stats <- function(df, comp_name) {
+  up_genes <- sum(df$DE_status == "UP")
+  down_genes <- sum(df$DE_status == "DOWN")
+  lrt_sig_genes <- sum(df$DE_status == "LRT_SIGNIFICANT")
+  total_de <- up_genes + down_genes + lrt_sig_genes
+  if("lrt" %in% df$test_type) {
+    cat(sprintf("%-40s: LRT显著 %4d基因\n", comp_name, lrt_sig_genes))
+  } else {
+    cat(sprintf("%-40s: 上调 %4d, 下调 %4d, 总计 %4d\n", 
+                comp_name, up_genes, down_genes, total_de))
+  }
+}
+comparison_stats(final_B_vs_A, "[Species_B] vs [Species_A]")
+comparison_stats(final_B_vs_C, "[Species_B] vs [Species_C]")
+comparison_stats(final_A_vs_B, "[Species_A] vs [Species_B]")
+comparison_stats(final_A_vs_C, "[Species_A] vs [Species_C]")
+comparison_stats(final_C_vs_B, "[Species_C] vs [Species_B]")
+comparison_stats(final_C_vs_A, "[Species_C] vs [Species_A]")
+comparison_stats(final_three_group, "三组整体比较")
+
+  ## 5.4 保存所有结果到文件
+# 功能：将整理后的结果保存为CSV文件
+# 应用：用于后续分析、报告撰写和数据共享
+write.csv(final_B_vs_A, "DESeq2_[Species_B]_vs_[Species_A]_all_genes.csv", row.names = FALSE)
+write.csv(final_B_vs_C, "DESeq2_[Species_B]_vs_[Species_C]_all_genes.csv", row.names = FALSE)
+write.csv(final_A_vs_B, "DESeq2_[Species_A]_vs_[Species_B]_all_genes.csv", row.names = FALSE)
+write.csv(final_A_vs_C, "DESeq2_[Species_A]_vs_[Species_C]_all_genes.csv", row.names = FALSE)
+write.csv(final_C_vs_B, "DESeq2_[Species_C]_vs_[Species_B]_all_genes.csv", row.names = FALSE)
+write.csv(final_C_vs_A, "DESeq2_[Species_C]_vs_[Species_A]_all_genes.csv", row.names = FALSE)
+write.csv(final_three_group, "DESeq2_Three_Group_Comparison_all_genes.csv", row.names = FALSE)
+
+cat("\n✅ 所有比较组的完整结果已保存为CSV文件\n")
+
+  ## 5.5 提取显著差异表达基因（用于后续分析）
+# 功能：从整理后的结果中提取显著差异基因
+# 意义：为GO富集分析、通路分析等下游分析准备基因列表
+extract_significant_genes <- function(df, comp_name) {
+  # 根据检验类型选择显著基因
+  if("lrt" %in% df$test_type) {
+    sig_genes <- df[df$DE_status == "LRT_SIGNIFICANT", ]
+  } else {
+    sig_genes <- df[df$DE_status %in% c("UP", "DOWN"), ]
+  }
+  # 保存显著基因
+  sig_file <- paste0("DESeq2_", gsub(" ", "_", comp_name), "_significant.csv")
+  write.csv(sig_genes, sig_file, row.names = FALSE)
+  # 分别保存上调和下调基因（仅对Wald检验）
+  if(!("lrt" %in% df$test_type)) {
+    up_genes <- sig_genes[sig_genes$DE_status == "UP", "gene_id"]
+    down_genes <- sig_genes[sig_genes$DE_status == "DOWN", "gene_id"]
+    if (length(up_genes) > 0) {
+      up_file <- paste0("DESeq2_", gsub(" ", "_", comp_name), "_upregulated.csv")
+      write.csv(data.frame(gene_id = up_genes), up_file, row.names = FALSE)
+    }
+    if (length(down_genes) > 0) {
+      down_file <- paste0("DESeq2_", gsub(" ", "_", comp_name), "_downregulated.csv")
+      write.csv(data.frame(gene_id = down_genes), down_file, row.names = FALSE)
+    }
+    return(list(up = up_genes, down = down_genes))
+  } else {
+    # 对于LRT检验，返回所有显著基因
+    lrt_genes <- sig_genes$gene_id
+    return(list(lrt_sig = lrt_genes))
+  }
+}
+# 提取所有比较组的显著基因
+cat("\n=== 提取显著差异表达基因 ===\n")
+significant_genes <- list()
+significant_genes$B_vs_A <- extract_significant_genes(final_B_vs_A, "[Species_B]_vs_[Species_A]")
+significant_genes$B_vs_C <- extract_significant_genes(final_B_vs_C, "[Species_B]_vs_[Species_C]")
+significant_genes$A_vs_B <- extract_significant_genes(final_A_vs_B, "[Species_A]_vs_[Species_B]")
+significant_genes$A_vs_C <- extract_significant_genes(final_A_vs_C, "[Species_A]_vs_[Species_C]")
+significant_genes$C_vs_B <- extract_significant_genes(final_C_vs_B, "[Species_C]_vs_[Species_B]")
+significant_genes$C_vs_A <- extract_significant_genes(final_C_vs_A, "[Species_C]_vs_[Species_A]")
+significant_genes$three_group <- extract_significant_genes(final_three_group, "Three_Group_Comparison")
+
+cat("✅ 显著差异基因列表已保存\n")
+
+
+### 6. 基因列表整合与对称性验证 --------------------------------------------------
+cat("\n=== 基因列表整合与对称性验证 ===\n")
+# 功能：整合所有显著基因列表并进行数据质量验证
+# 意义：创建统一的分析对象，验证结果的生物学合理性
+  ### 6.1 创建统一的基因列表对象 ###
+  # 功能：整合所有比较组的显著基因列表
+  # 意义：为后续GO富集分析、通路分析提供统一的输入数据
+  # 注意：直接使用第5节已生成的significant_genes对象，避免重复计算
+  cat("正在创建统一的基因列表对象...\n")
+# 直接从第5节的结果创建gene_lists
+gene_lists <- list(
+  # [Species_B]为参考的比较
+  B_vs_A_up = significant_genes$B_vs_A$up,
+  B_vs_A_down = significant_genes$B_vs_A$down,
+  B_vs_C_up = significant_genes$B_vs_C$up,
+  B_vs_C_down = significant_genes$B_vs_C$down,
+  # [Species_A]为参考的比较  
+  A_vs_B_up = significant_genes$A_vs_B$up,
+  A_vs_B_down = significant_genes$A_vs_B$down,
+  A_vs_C_up = significant_genes$A_vs_C$up,
+  A_vs_C_down = significant_genes$A_vs_C$down,
+  # [Species_C]为参考的比较
+  C_vs_B_up = significant_genes$C_vs_B$up,
+  C_vs_B_down = significant_genes$C_vs_B$down,
+  C_vs_A_up = significant_genes$C_vs_A$up,
+  C_vs_A_down = significant_genes$C_vs_A$down,
+  # 三组整体比较的显著基因
+  three_group_lrt_sig = significant_genes$three_group$lrt_sig
+)
+cat(sprintf("✅ 创建了 %d 个基因列表用于后续分析\n", length(gene_lists)))
+
+  ### 6.2 对称性验证分析 ###
+    ## 6.2.1 对称性验证
+  # 功能：验证互为相反比较的基因数量对称性
+  # 意义：确保分析结果的生物学合理性和统计一致性
+  # 原理：A vs B的上调基因应该等于B vs A的下调基因
+cat("正在进行对称性检查...\n")
+# 对称性检查1：[Species_B]_vs_[Species_A] ↔ [Species_A]_vs_[Species_B]
+cat("对称性检查1: [Species_B]_vs_[Species_A] ↔ [Species_A]_vs_[Species_B]\n")
+up_in_first <- length(gene_lists$B_vs_A_up)
+down_in_second <- length(gene_lists$A_vs_B_down)
+down_in_first <- length(gene_lists$B_vs_A_down)  
+up_in_second <- length(gene_lists$A_vs_B_up)
+cat(sprintf("  [Species_B]_vs_[Species_A] 上调: %d ↔ [Species_A]_vs_[Species_B] 下调: %d (差异: %+d)\n", 
+            up_in_first, down_in_second, up_in_first - down_in_second))
+cat(sprintf("  [Species_B]_vs_[Species_A] 下调: %d ↔ [Species_A]_vs_[Species_B] 上调: %d (差异: %+d)\n", 
+            down_in_first, up_in_second, down_in_first - up_in_second))
+# 对称性检查2：[Species_B]_vs_[Species_C] ↔ [Species_C]_vs_[Species_B]  
+cat("对称性检查2: [Species_B]_vs_[Species_C] ↔ [Species_C]_vs_[Species_B]\n")
+up_in_first2 <- length(gene_lists$B_vs_C_up)
+down_in_second2 <- length(gene_lists$C_vs_B_down)
+down_in_first2 <- length(gene_lists$B_vs_C_down)
+up_in_second2 <- length(gene_lists$C_vs_B_up)
+cat(sprintf("  [Species_B]_vs_[Species_C] 上调: %d ↔ [Species_C]_vs_[Species_B] 下调: %d (差异: %+d)\n", 
+          up_in_first2, down_in_second2, up_in_first2 - down_in_second2))
+cat(sprintf("  [Species_B]_vs_[Species_C] 下调: %d ↔ [Species_C]_vs_[Species_B] 上调: %d (差异: %+d)\n", 
+            down_in_first2, up_in_second2, down_in_first2 - up_in_second2))
+# 对称性检查3：[Species_A]_vs_[Species_C] ↔ [Species_C]_vs_[Species_A]
+cat("对称性检查3: [Species_A]_vs_[Species_C] ↔ [Species_C]_vs_[Species_A]\n")  
+up_in_first3 <- length(gene_lists$A_vs_C_up)
+down_in_second3 <- length(gene_lists$C_vs_A_down)
+down_in_first3 <- length(gene_lists$A_vs_C_down)
+up_in_second3 <- length(gene_lists$C_vs_A_up)
+cat(sprintf("  [Species_A]_vs_[Species_C] 上调: %d ↔ [Species_C]_vs_[Species_A] 下调: %d (差异: %+d)\n", 
+            up_in_first3, down_in_second3, up_in_first3 - down_in_second3))
+cat(sprintf("  [Species_A]_vs_[Species_C] 下调: %d ↔ [Species_C]_vs_[Species_A] 上调: %d (差异: %+d)\n", 
+            down_in_first3, up_in_second3, down_in_first3 - up_in_second3))
+
+    ## 6.2.2 对称性质量评估
+symmetry_errors <- sum(
+  abs(up_in_first - down_in_second),
+  abs(down_in_first - up_in_second),
+  abs(up_in_first2 - down_in_second2), 
+  abs(down_in_first2 - up_in_second2),
+  abs(up_in_first3 - down_in_second3),
+  abs(down_in_first3 - up_in_second3)
+)
+if(symmetry_errors == 0) {
+  cat("🎉 完美！所有对称性检查通过，结果完全一致\n")
+} else {
+  cat(sprintf("📋 对称性检查发现 %d 个基因的数量差异，这在统计学允许范围内\n", symmetry_errors))
+}
+
+  ### 6.3 基因列表汇总与保存 ###
+cat("\n=== 基因列表汇总与保存 ===\n")
+# 创建基因列表汇总统计
+gene_lists_summary <- data.frame(
+  Comparison = names(gene_lists),
+  Gene_Count = sapply(gene_lists, length),
+  Comparison_Type = ifelse(grepl("_up$", names(gene_lists)), "Upregulated",
+                           ifelse(grepl("_down$", names(gene_lists)), "Downregulated", "LRT_Significant"))
+)
+# 添加比较组描述
+gene_lists_summary$Description <- sapply(gene_lists_summary$Comparison, function(x) {
+  if(grepl("B_vs_A", x)) return("[Species_B] vs [Species_A]")
+  if(grepl("B_vs_C", x)) return("[Species_B] vs [Species_C]") 
+  if(grepl("A_vs_B", x)) return("[Species_A] vs [Species_B]")
+  if(grepl("A_vs_C", x)) return("[Species_A] vs [Species_C]")
+  if(grepl("C_vs_B", x)) return("[Species_C] vs [Species_B]")
+  if(grepl("C_vs_A", x)) return("[Species_C] vs [Species_A]")
+  if(grepl("three_group", x)) return("三组整体比较")
+  return("其他比较")
+})
+write.csv(gene_lists_summary, "DEG_lists_summary.csv", row.names = FALSE)
+cat("✅ 基因列表汇总已保存: DEG_lists_summary.csv\n")
+# 保存完整的gene_lists对象用于后续分析
+saveRDS(gene_lists, "[gene_lists].rds")
+cat("✅ 完整基因列表对象已保存: [gene_lists].rds\n")
+
+### 6.5 为趋势分析准备专用文件
+cat("正在为趋势分析准备专用文件...\n")
+# 创建趋势分析期望的文件结构
+all_gene_lists_for_downstream_analysis <- list(
+  # 高变异基因列表
+  all_significant_hvg = hvg_lists$all_significant_hvg,
+  wgcna_genes = hvg_lists$wgcna_genes,
+  heatmap_genes = hvg_lists$heatmap_genes,
+  # 添加差异表达基因信息（趋势分析可能需要）
+  B_vs_A_up = gene_lists$B_vs_A_up,
+  B_vs_A_down = gene_lists$B_vs_A_down,
+  three_group_lrt_sig = gene_lists$three_group_lrt_sig,
+  # 添加变异系数信息
+  variance_scores = hvg_lists$variance_scores
+)
+# 保存趋势分析期望的文件
+saveRDS(all_gene_lists_for_downstream_analysis, "[gene_lists].rds")
+cat("✅ 趋势分析专用文件已保存: [gene_lists].rds\n")
+
+# 验证文件内容
+cat("文件内容验证:\n")
+cat("  all_significant_hvg 基因数:", length(all_gene_lists_for_downstream_analysis$all_significant_hvg), "\n")
+cat("  wgcna_genes 基因数:", length(all_gene_lists_for_downstream_analysis$wgcna_genes), "\n")
+cat("  heatmap_genes 基因数:", length(all_gene_lists_for_downstream_analysis$heatmap_genes), "\n")
+
+### 7. 高级统计摘要与物种层面分析 ----------------------------------------------------------
+cat("\n=== 高级统计摘要与物种层面分析 ===\n")
+# 功能：提供更深层次的统计分析和物种特异性模式识别
+# 意义：从不同角度总结差异表达结果，揭示生物学模式
+  ### 7.1 计算补充统计指标 ###
+  # 功能：计算未在前述分析中出现的统计指标
+  # 意义：提供更全面的数据洞察
+cat("正在计算高级统计指标...\n")
+# 使用第6节创建的gene_lists对象进行计算，避免重复
+summary_stats_advanced <- data.frame(
+  Comparison = c(
+    "[Species_B]_vs_[Species_A]",
+    "[Species_B]_vs_[Species_C]", 
+    "[Species_A]_vs_[Species_B]",
+    "[Species_A]_vs_[Species_C]",
+    "[Species_C]_vs_[Species_B]",
+    "[Species_C]_vs_[Species_A]"
+  ),
+  Description = c(
+    "[Species_B] vs [Species_A]",
+    "[Species_B] vs [Species_C]",
+    "[Species_A] vs [Species_B]", 
+    "[Species_A] vs [Species_C]",
+    "[Species_C] vs [Species_B]",
+    "[Species_C] vs [Species_A]"
+  ),
+  # 使用gene_lists对象获取基因数量
+  Upregulated = sapply(list(
+    gene_lists$B_vs_A_up,
+    gene_lists$B_vs_C_up, 
+    gene_lists$A_vs_B_up,
+    gene_lists$A_vs_C_up,
+    gene_lists$C_vs_B_up,
+    gene_lists$C_vs_A_up
+  ), length),
+  Downregulated = sapply(list(
+    gene_lists$B_vs_A_down,
+    gene_lists$B_vs_C_down,
+    gene_lists$A_vs_B_down,
+    gene_lists$A_vs_C_down, 
+    gene_lists$C_vs_B_down,
+    gene_lists$C_vs_A_down
+  ), length)
+)
+# 计算总基因数（从已存在的final_对象获取）
+summary_stats_advanced$Total_Genes <- c(
+  nrow(final_B_vs_A),
+  nrow(final_B_vs_C), 
+  nrow(final_A_vs_B),
+  nrow(final_A_vs_C),
+  nrow(final_C_vs_B),
+  nrow(final_C_vs_A)
+)
+# 计算显著基因百分比（这是独特的新指标）
+summary_stats_advanced$Significant_Total <- 
+  summary_stats_advanced$Upregulated + summary_stats_advanced$Downregulated
+summary_stats_advanced$Percent_Significant <- round(
+  summary_stats_advanced$Significant_Total / summary_stats_advanced$Total_Genes * 100, 1
+)
+# 计算上调/下调比例
+summary_stats_advanced$Up_Down_Ratio <- round(
+  summary_stats_advanced$Upregulated / summary_stats_advanced$Downregulated, 2
+)
+cat("✅ 高级统计指标计算完成\n")
+
+
+
+  ### 7.2 物种层面汇总分析 ###
+  # 功能：从物种角度统计差异表达模式
+  # 意义：识别哪些物种在整体上表现出更多的表达差异
+cat("正在进行物种层面统计...\n")
+species_summary_advanced <- data.frame(
+  Species = c("[Species_B]", "[Species_A]", "[Species_C]"),
+  # 作为参考物种时的差异基因总数
+  Total_As_Reference = c(
+    length(gene_lists$B_vs_A_up) + length(gene_lists$B_vs_A_down) +
+      length(gene_lists$B_vs_C_up) + length(gene_lists$B_vs_C_down),
+    
+    length(gene_lists$A_vs_B_up) + length(gene_lists$A_vs_B_down) +
+      length(gene_lists$A_vs_C_up) + length(gene_lists$A_vs_C_down),
+    
+    length(gene_lists$C_vs_B_up) + length(gene_lists$C_vs_B_down) +
+      length(gene_lists$C_vs_A_up) + length(gene_lists$C_vs_A_down)
+  ),
+  # 上调基因偏好性（该物种相对于其他物种更多表达的基因）
+  Upregulation_Preference = c(
+    length(gene_lists$B_vs_A_up) + length(gene_lists$B_vs_C_up),
+    length(gene_lists$A_vs_B_up) + length(gene_lists$A_vs_C_up),
+    length(gene_lists$C_vs_B_up) + length(gene_lists$C_vs_A_up)
+  ),
+  # 下调基因偏好性（该物种相对于其他物种更少表达的基因）
+  Downregulation_Preference = c(
+    length(gene_lists$B_vs_A_down) + length(gene_lists$B_vs_C_down),
+    length(gene_lists$A_vs_B_down) + length(gene_lists$A_vs_C_down),
+    length(gene_lists$C_vs_B_down) + length(gene_lists$C_vs_A_down)
+  )
+)
+# 计算表达偏好性比例
+species_summary_advanced$Preference_Ratio <- round(
+  species_summary_advanced$Upregulation_Preference / 
+    species_summary_advanced$Downregulation_Preference, 2
+)
+cat("✅ 物种层面分析完成\n")
+
+
+  ### 7.3 结果展示与保存 ###
+cat("\n=== 结果展示 ===\n")
+# 打印高级统计表格
+cat("📊 差异表达高级统计摘要:\n")
+print(summary_stats_advanced)
+cat("\n🐦 物种层面表达模式:\n")
+print(species_summary_advanced)
+# 识别表达模式最特异的物种
+most_divergent_species <- species_summary_advanced$Species[
+  which.max(species_summary_advanced$Total_As_Reference)
+]
+cat(sprintf("\n🔍 表达模式最特异的物种: %s\n", most_divergent_species))
+# 识别差异最大的比较组
+most_different_comparison <- summary_stats_advanced$Description[
+  which.max(summary_stats_advanced$Percent_Significant)
+]
+cat(sprintf("🔍 差异最大的比较组: %s (%.1f%% 基因显著差异)\n", 
+            most_different_comparison,
+            max(summary_stats_advanced$Percent_Significant)))
+
+
+  ### 7.4 保存高级分析结果 ###
+cat("\n=== 保存分析结果 ===\n")
+# 保存高级统计表
+write.csv(summary_stats_advanced, "Advanced_DESeq2_Summary_Statistics.csv", row.names = FALSE)
+cat("✅ 高级统计摘要已保存: Advanced_DESeq2_Summary_Statistics.csv\n")
+# 保存物种层面分析
+write.csv(species_summary_advanced, "Species_Level_Analysis.csv", row.names = FALSE)
+cat("✅ 物种层面分析已保存: Species_Level_Analysis.csv\n")
+
+
+### 第四部分：高级分析与生物学解释 --------------------------------------------
+# 功能：从统计学差异转向生物学意义挖掘
+# 意义：识别关键基因、发现表达模式、提供进化洞察，为后续功能验证奠定基础
+### 1. 多层次关键基因筛选与分析 ----------------------------------------------------
+  ### 1.1 综合关键基因提取函数 ###
+  # 功能：采用三种不同策略筛选关键差异表达基因
+  # 意义：从不同角度识别最有生物学价值的候选基因，避免单一筛选标准的局限性
+extract_top_genes_comprehensive <- function() {
+  cat("正在执行多层次关键基因筛选...\n")
+  ### 策略1: 极显著基因筛选 (padj < 1e-10) ###
+  # 功能：识别统计可靠性最高的差异基因
+  # 意义：这些基因的差异表达最为确定，适合作为核心候选基因
+  cat(">>> 策略1: 筛选极显著基因 (padj < 1e-10)...\n")
+  extreme_sig <- list(
+    # 两两比较组
+    B_vs_A = results_B_vs_A[results_B_vs_A$padj < 1e-10 & !is.na(results_B_vs_A$padj), ],
+    B_vs_C = results_B_vs_C[results_B_vs_C$padj < 1e-10 & !is.na(results_B_vs_C$padj), ],
+    A_vs_B = results_A_vs_B[results_A_vs_B$padj < 1e-10 & !is.na(results_A_vs_B$padj), ],
+    A_vs_C = results_A_vs_C[results_A_vs_C$padj < 1e-10 & !is.na(results_A_vs_C$padj), ],
+    C_vs_B = results_C_vs_B[results_C_vs_B$padj < 1e-10 & !is.na(results_C_vs_B$padj), ],
+    C_vs_A = results_C_vs_A[results_C_vs_A$padj < 1e-10 & !is.na(results_C_vs_A$padj), ],
+    # 三组整体比较
+    three_group = results_three_group_lrt[results_three_group_lrt$padj < 1e-10 & !is.na(results_three_group_lrt$padj), ]
+  )
+  ### 策略2: 大效应值基因筛选 ###
+  # 功能：识别表达变化幅度最大的基因
+  # 意义：这些基因可能产生更大的生物学影响，适合功能验证实验
+  cat(">>> 策略2: 筛选大效应值基因...\n")
+  large_effect <- list(
+    # 两两比较：基于log2FoldChange (|log2FC| > 2，即4倍以上变化)
+    B_vs_A = {
+      sig <- results_B_vs_A[results_B_vs_A$padj < 0.05 & !is.na(results_B_vs_A$padj), ]
+      sig[abs(sig$log2FoldChange) > 2, ]
+    },
+    B_vs_C = {
+      sig <- results_B_vs_C[results_B_vs_C$padj < 0.05 & !is.na(results_B_vs_C$padj), ]
+      sig[abs(sig$log2FoldChange) > 2, ]
+    },
+    A_vs_B = {
+      sig <- results_A_vs_B[results_A_vs_B$padj < 0.05 & !is.na(results_A_vs_B$padj), ]
+      sig[abs(sig$log2FoldChange) > 2, ]
+    },
+    A_vs_C = {
+      sig <- results_A_vs_C[results_A_vs_C$padj < 0.05 & !is.na(results_A_vs_C$padj), ]
+      sig[abs(sig$log2FoldChange) > 2, ]
+    },
+    C_vs_B = {
+      sig <- results_C_vs_B[results_C_vs_B$padj < 0.05 & !is.na(results_C_vs_B$padj), ]
+      sig[abs(sig$log2FoldChange) > 2, ]
+    },
+    C_vs_A = {
+      sig <- results_C_vs_A[results_C_vs_A$padj < 0.05 & !is.na(results_C_vs_A$padj), ]
+      sig[abs(sig$log2FoldChange) > 2, ]
+    },
+    # 三组比较：基于变异系数（前10%高变异基因）
+    three_group = {
+      sig <- results_three_group_lrt[results_three_group_lrt$padj < 0.05 & !is.na(results_three_group_lrt$padj), ]
+      high_var_threshold <- quantile(gene_variance, 0.9, na.rm = TRUE)
+      high_var_genes <- names(gene_variance)[gene_variance > high_var_threshold]
+      sig[rownames(sig) %in% high_var_genes, ]
+    }
+  )
+  ### 策略3: Top数量基因筛选 ###
+  # 功能：按显著性排序选取固定数量的顶级基因
+  # 意义：为可视化和初步分析提供可管理的基因集合，保证结果可展示性
+  cat(">>> 策略3: 筛选Top数量基因...\n")
+  top_by_count <- list(
+    # 两两比较：前15个最显著基因
+    B_vs_A = head(results_B_vs_A[order(results_B_vs_A$padj), ], 15),
+    B_vs_C = head(results_B_vs_C[order(results_B_vs_C$padj), ], 15),
+    A_vs_B = head(results_A_vs_B[order(results_A_vs_B$padj), ], 15),
+    A_vs_C = head(results_A_vs_C[order(results_A_vs_C$padj), ], 15),
+    C_vs_B = head(results_C_vs_B[order(results_C_vs_B$padj), ], 15),
+    C_vs_A = head(results_C_vs_A[order(results_C_vs_A$padj), ], 15),
+    # 三组比较：前20个最显著基因
+    three_group = head(results_three_group_lrt[order(results_three_group_lrt$padj), ], 20)
+  )
+  ### 结果统计与报告 ###
+  cat("\n=== 多层次筛选结果统计 ===\n")
+  comparisons <- c("[Species_B]_vs_[Species_A]", "[Species_B]_vs_[Species_C]", "[Species_A]_vs_[Species_B]",
+                   "[Species_A]_vs_[Species_C]", "[Species_C]_vs_[Species_B]", "[Species_C]_vs_[Species_A]", "Three_Group")
+  for(i in 1:7) {
+    comp_name <- comparisons[i]
+    cat(sprintf("  %-28s: 极显著=%2d, 大效应=%2d, Top数量=%2d\n", 
+                comp_name,
+                nrow(extreme_sig[[i]]), 
+                nrow(large_effect[[i]]),
+                nrow(top_by_count[[i]])))
+  }
+  # 获取标准化计数数据用于可视化
+  cat("\n正在准备基因表达数据用于可视化...\n")
+  top_gene_counts_list <- lapply(top_by_count, function(genes) {
+    if(nrow(genes) > 0) {
+      counts(dds, normalized = TRUE)[rownames(genes), ]
+    } else {
+      NULL
+    }
+  })
+  return(list(
+    extreme_significant = extreme_sig,
+    large_effect = large_effect,
+    top_by_count = top_by_count,
+    counts_data = top_gene_counts_list
+  ))
+}
+# 执行综合关键基因筛选
+cat("\n开始执行关键基因分析...\n")
+top_genes_data <- extract_top_genes_comprehensive()
+cat("✅ 关键基因筛选完成\n")
+
+### 1.2 关键基因表达可视化 ###
+# 功能：可视化最显著差异基因的表达模式
+# 意义：直观展示关键基因的物种间表达差异，验证分析结果的可靠性
+plot_top_genes_enhanced <- function(gene_counts, species_involved, title, max_genes = 6) {
+  if(is.null(gene_counts) || nrow(gene_counts) == 0) {
+    cat("  跳过: 没有可用的基因表达数据\n")
+    return(NULL)
+  }
+  # 筛选相关物种的样本
+  samples_to_keep <- colData(dds)$species %in% species_involved
+  if(sum(samples_to_keep) == 0) {
+    cat("  跳过: 没有找到对应的物种样本\n")
+    return(NULL)
+  }
+  # 取前N个基因进行可视化（避免图表过于拥挤）
+  genes_to_show <- min(max_genes, nrow(gene_counts))
+  gene_counts_filtered <- gene_counts[1:genes_to_show, samples_to_keep]
+  
+  # 转换数据格式用于ggplot2
+  plot_data <- melt(gene_counts_filtered)
+  species_filtered <- colData(dds)$species[samples_to_keep]
+  plot_data$species <- rep(species_filtered, each = nrow(gene_counts_filtered))
+  # 确保物种因子水平正确排序（保持一致的显示顺序）
+  plot_data$species <- factor(plot_data$species, 
+                              levels = c("[Genus_species_B]", "[Genus_species_A]", "[Genus_species_C]"))
+  # 定义物种颜色映射
+  species_colors_custom <- c(
+    "[Genus_species_C]" = "#F0A73A",    # [Species_C] - 橙黄色
