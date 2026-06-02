@@ -1,0 +1,626 @@
+###############################################################################
+# 第四章：KEGG通路分析模块（新流程优化版）
+# 基于DESeq2→趋势分析→WGCNA流程的基因集合
+# 重点关注：行为相关通路发现 + 网络关键模块通路特征
+###############################################################################
+
+### 4.1 KEGG分析环境设置与注释检查（新流程优化版）
+cat("第四章：KEGG通路分析环境设置与质量检查\n")
+
+setup_kegg_analysis_environment <- function() {
+  cat("=== KEGG通路分析环境设置 ===\n")
+  kegg_packages <- c(
+    "clusterProfiler",
+    "org.[YourSpecies].eg.db",
+    "enrichplot",
+    "pathview",
+    "KEGGREST",
+    "httr",
+    "jsonlite"
+  )
+  cat("步骤1: 检查KEGG分析专用包...\n")
+  for (pkg in kegg_packages) {
+    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+      if (pkg %in% c("clusterProfiler", "org.[YourSpecies].eg.db", "enrichplot")) {
+        BiocManager::install(pkg)
+      } else {
+        install.packages(pkg)
+      }
+      library(pkg, character.only = TRUE)
+      cat("   加载: ", pkg, " ", packageVersion(pkg), "\n", sep = "")
+    }
+  }
+  cat("步骤2: 配置KEGG分析环境...\n")
+  options(timeout = 300)
+  set.seed(123)
+  cat("✅ KEGG分析环境设置完成\n")
+  return(TRUE)
+}
+
+library(R.utils)
+R.utils::setOption("clusterProfiler.download.method", 'auto')
+
+### 4.2 深度KEGG注释质量评估（新流程适配版）
+evaluate_kegg_annotation_quality <- function(gene_lists) {
+  cat("\n=== 深度KEGG注释质量评估 ===\n")
+  cat("步骤1: 收集新流程所有分析基因...\n")
+  all_analysis_genes <- unique(unlist(gene_lists))
+  cat("   新流程总基因数量: ", length(all_analysis_genes), "\n", sep = "")
+  cat("   各分析方法基因贡献:\n")
+  for (list_name in names(gene_lists)) {
+    gene_count <- length(gene_lists[[list_name]])
+    cat("     - ", list_name, ": ", gene_count, " 个基因\n", sep = "")
+  }
+  cat("步骤2: 探索OrgDb包结构...\n")
+  available_columns <- columns(org.[YourSpecies].eg.db)
+  cat("   OrgDb包总列数: ", length(available_columns), "\n", sep = "")
+  kegg_keywords <- c("KEGG", "PATH", "KO", "PATHWAY")
+  kegg_related_columns <- character()
+  for (keyword in kegg_keywords) {
+    matches <- available_columns[grep(keyword, available_columns, ignore.case = TRUE)]
+    kegg_related_columns <- unique(c(kegg_related_columns, matches))
+  }
+  cat("   发现的KEGG相关列: ", length(kegg_related_columns), "\n", sep = "")
+  if (length(kegg_related_columns) > 0) {
+    cat("    具体列名: ", paste(kegg_related_columns, collapse = ", "), "\n")
+  }
+  cat("步骤3: 系统测试KEGG相关列...\n")
+  column_evaluation_results <- list()
+  for (kegg_column in kegg_related_columns) {
+    cat("   测试列: ", kegg_column, "... ", sep = "")
+    tryCatch({
+      test_genes <- sample(all_analysis_genes, min(20, length(all_analysis_genes)))
+      test_annotation <- AnnotationDbi::select(
+        org.[YourSpecies].eg.db,
+        keys = test_genes,
+        columns = kegg_column,
+        keytype = "GID"
+      )
+      total_tests <- length(test_genes)
+      valid_entries <- sum(!is.na(test_annotation[[kegg_column]]))
+      unique_annotations <- length(unique(na.omit(test_annotation[[kegg_column]])))
+      coverage_rate <- valid_entries / total_tests * 100
+      column_evaluation_results[[kegg_column]] <- list(
+        success = TRUE,
+        coverage_rate = coverage_rate,
+        valid_entries = valid_entries,
+        unique_annotations = unique_annotations,
+        sample_annotations = head(na.omit(test_annotation[[kegg_column]]), 3),
+        test_size = total_tests
+      )
+      cat("成功 | 覆盖度: ", round(coverage_rate, 1), "% | ", 
+          "有效条目: ", valid_entries, "/", total_tests, " | ",
+          "唯一注释: ", unique_annotations, "\n", sep = "")
+    }, error = function(e) {
+      column_evaluation_results[[kegg_column]] <- list(
+        success = FALSE,
+        error_message = e$message
+      )
+      cat("失败 | 错误: ", e$message, "\n", sep = "")
+    })
+  }
+  cat("步骤4: 选择最佳KEGG注释列...\n")
+  successful_columns <- names(column_evaluation_results)[
+    sapply(column_evaluation_results, function(x) x$success)
+  ]
+  if (length(successful_columns) == 0) {
+    cat("   ❌ 严重问题: 所有KEGG相关列测试失败！\n")
+    return(list(
+      analysis_possible = FALSE,
+      error_message = "没有可用的KEGG注释列",
+      evaluation_details = column_evaluation_results
+    ))
+  }
+  coverage_rates <- sapply(column_evaluation_results[successful_columns], 
+                           function(x) x$coverage_rate)
+  best_column <- successful_columns[which.max(coverage_rates)]
+  best_coverage <- max(coverage_rates)
+  cat("   ✅ 选择最佳列: ", best_column, "\n", sep = "")
+  cat("   最佳列覆盖度: ", round(best_coverage, 1), "%\n", sep = "")
+  cat("步骤5: 完整注释覆盖度评估...\n")
+  full_annotation <- AnnotationDbi::select(
+    org.[YourSpecies].eg.db,
+    keys = all_analysis_genes,
+    columns = best_column,
+    keytype = "GID"
+  )
+  genes_with_kegg <- unique(full_annotation$GID[!is.na(full_annotation[[best_column]])])
+  overall_coverage <- length(genes_with_kegg) / length(all_analysis_genes) * 100
+  cat("   总体KEGG注释覆盖度: ", round(overall_coverage, 1), "%\n", sep = "")
+  cat("   有KEGG注释基因数: ", length(genes_with_kegg), "/", 
+      length(all_analysis_genes), "\n", sep = "")
+  cat("   各分析方法KEGG覆盖度:\n")
+  method_coverage <- list()
+  for (list_name in names(gene_lists)) {
+    method_genes <- gene_lists[[list_name]]
+    method_with_kegg <- sum(method_genes %in% genes_with_kegg)
+    method_coverage_rate <- method_with_kegg / length(method_genes) * 100
+    method_coverage[[list_name]] <- method_coverage_rate
+    cat("     - ", list_name, ": ", round(method_coverage_rate, 1), 
+        "% (", method_with_kegg, "/", length(method_genes), ")\n", sep = "")
+  }
+  cat("步骤6: 生成详细的质量评估报告...\n")
+  quality_report <- list(
+    analysis_possible = overall_coverage >= 10,
+    best_kegg_column = best_column,
+    overall_coverage_rate = overall_coverage,
+    genes_with_kegg = genes_with_kegg,
+    total_analysis_genes = length(all_analysis_genes),
+    method_coverage_rates = method_coverage,
+    column_evaluation_details = column_evaluation_results,
+    full_annotation_data = full_annotation,
+    quality_assessment = ifelse(overall_coverage >= 30, "优秀",
+                                ifelse(overall_coverage >= 15, "良好",
+                                       ifelse(overall_coverage >= 10, "一般", "较差")))
+  )
+  cat("步骤6: KEGG注释质量评估结论...\n")
+  if (quality_report$analysis_possible) {
+    cat("   ✅ KEGG分析可行性: 通过\n")
+    cat("   质量等级: ", quality_report$quality_assessment, "\n", sep = "")
+    cat("   推荐进行KEGG通路富集分析\n")
+  } else {
+    cat("   ❌ KEGG分析可行性: 不通过\n")
+    cat("   警告: KEGG注释覆盖度过低，分析结果可能不可靠\n")
+    cat("   建议: 专注于GO分析结果，或考虑其他通路分析方法\n")
+  }
+  cat("✅ KEGG注释质量评估完成\n")
+  return(quality_report)
+}
+
+### 4.3 KEGG分析策略制定器（新流程优化版）
+formulate_kegg_analysis_strategy <- function(quality_report, gene_lists) {
+  cat("\n=== KEGG分析策略制定 ===\n")
+  analysis_strategy <- list()
+  if (!quality_report$analysis_possible) {
+    cat("步骤1: 分析可行性评估...\n")
+    cat("   ❌ KEGG分析不可行: 注释覆盖度过低\n")
+    cat("   制定备选方案...\n")
+    analysis_strategy$primary_analysis <- "NOT_RECOMMENDED"
+    analysis_strategy$reason <- paste("KEGG注释覆盖度过低:",
+                                      round(quality_report$overall_coverage_rate, 1), "%")
+    analysis_strategy$alternative_approaches <- c(
+      "专注于GO富集分析结果",
+      "考虑使用其他通路数据库（如Reactome）",
+      "使用基因集富集分析（GSEA）方法",
+      "基于蛋白质互作网络进行模块分析"
+    )
+    return(analysis_strategy)
+  }
+  cat("步骤1: 制定基因列表优先级策略...\n")
+  priority_scores <- list()
+  for (list_name in names(gene_lists)) {
+    genes <- gene_lists[[list_name]]
+    coverage_rate <- quality_report$method_coverage_rates[[list_name]]
+    gene_count <- length(genes)
+    coverage_score <- coverage_rate / 100 * 0.6
+    count_score <- pmin(gene_count / 100, 1) * 0.4
+    priority_score <- coverage_score + count_score
+    priority_scores[[list_name]] <- list(
+      coverage_rate = coverage_rate,
+      gene_count = gene_count,
+      priority_score = priority_score,
+      recommended = coverage_rate >= 20 && gene_count >= 15
+    )
+  }
+  cat("步骤2: 基因列表分类和分析计划制定...\n")
+  high_priority_lists <- names(priority_scores)[
+    sapply(priority_scores, function(x) x$recommended)
+  ]
+  medium_priority_lists <- names(priority_scores)[
+    sapply(priority_scores, function(x) 
+      !x$recommended && x$coverage_rate >= 10 && x$gene_count >= 10)
+  ]
+  low_priority_lists <- names(priority_scores)[
+    sapply(priority_scores, function(x) 
+      x$coverage_rate < 10 || x$gene_count < 10)
+  ]
+  cat("   高优先级列表 (推荐分析): ", length(high_priority_lists), "\n", sep = "")
+  for (list_name in high_priority_lists) {
+    score_info <- priority_scores[[list_name]]
+    cat("     - ", list_name, ": ", round(score_info$coverage_rate, 1),
+        "% 覆盖度, ", score_info$gene_count, " 基因\n", sep = "")
+  }
+  cat("   中优先级列表 (条件分析): ", length(medium_priority_lists), "\n", sep = "")
+  cat("   低优先级列表 (不推荐): ", length(low_priority_lists), "\n", sep = "")
+  cat("步骤3: 制定分析参数策略...\n")
+  overall_coverage <- quality_report$overall_coverage_rate
+  if (overall_coverage >= 30) {
+    analysis_params <- list(
+      pvalue_cutoff = 0.05,
+      qvalue_cutoff = 0.2,
+      minGSSize = 10,
+      maxGSSize = 500,
+      organism = "ko",
+      keyType = "kegg"
+    )
+    cat("   参数策略: 标准参数 (高质量注释)\n")
+  } else if (overall_coverage >= 15) {
+    analysis_params <- list(
+      pvalue_cutoff = 0.1,
+      qvalue_cutoff = 0.3,
+      minGSSize = 5,
+      maxGSSize = 800,
+      organism = "ko",
+      keyType = "kegg"
+    )
+    cat("   参数策略: 宽松参数 (中等质量注释)\n")
+  } else {
+    analysis_params <- list(
+      pvalue_cutoff = 0.15,
+      qvalue_cutoff = 0.4,
+      minGSSize = 3,
+      maxGSSize = 1000,
+      organism = "ko", 
+      keyType = "kegg"
+    )
+    cat("   参数策略: 极宽松参数 (低质量注释)\n")
+  }
+  cat("步骤4: 制定备选分析方案...\n")
+  alternative_strategies <- list(
+    primary = "标准KEGG富集分析",
+    secondary = c(
+      "KEGG模块富集分析",
+      "通路拓扑分析",
+      "基于GO结果的通路推断"
+    ),
+    fallback = "专注于GO分析和蛋白质互作网络分析"
+  )
+  analysis_strategy <- list(
+    primary_analysis = "RECOMMENDED",
+    overall_quality = quality_report$quality_assessment,
+    best_kegg_column = quality_report$best_kegg_column,
+    high_priority_lists = high_priority_lists,
+    medium_priority_lists = medium_priority_lists,
+    low_priority_lists = low_priority_lists,
+    priority_scores = priority_scores,
+    analysis_parameters = analysis_params,
+    alternative_strategies = alternative_strategies,
+    expected_success_rate = round(mean(sapply(priority_scores[high_priority_lists], 
+                                              function(x) x$coverage_rate)), 1)
+  )
+  cat("步骤5: 策略制定完成...\n")
+  cat("   预期成功率: ", analysis_strategy$expected_success_rate, "%\n", sep = "")
+  cat("   重点分析列表: ", length(high_priority_lists), " 个\n", sep = "")
+  cat("   分析参数: ", analysis_params$pvalue_cutoff, " p值阈值\n", sep = "")
+  cat("✅ KEGG分析策略制定完成\n")
+  return(analysis_strategy)
+}
+
+### 4.4 新流程KEGG分析数据准备主函数
+execute_new_pipeline_kegg_preparation <- function(prepared_data) {
+  cat("第四章：KEGG通路分析数据准备 - 开始执行\n")
+  cat("步骤0: 输入数据验证和环境设置\n")
+  if (is.null(prepared_data) || is.null(prepared_data$all_gene_lists)) {
+    cat("❌ 错误: 未找到基因列表数据\n")
+    return(NULL)
+  }
+  gene_lists <- prepared_data$all_gene_lists
+  cat("✅ 输入数据验证通过\n")
+  cat("   待分析基因列表数量: ", length(gene_lists), "\n", sep = "")
+  cat("   总基因数量: ", length(unique(unlist(gene_lists))), "\n", sep = "")
+  cat("\n步骤1: 设置KEGG分析专用环境\n")
+  env_status <- setup_kegg_analysis_environment()
+  if (!env_status) {
+    cat("❌ KEGG分析环境设置失败\n")
+    return(NULL)
+  }
+  cat("\n步骤2: 执行深度KEGG注释质量评估\n")
+  quality_report <- evaluate_kegg_annotation_quality(gene_lists)
+  cat("\n步骤3: 制定KEGG分析策略\n")
+  analysis_strategy <- formulate_kegg_analysis_strategy(quality_report, gene_lists)
+  cat("\n步骤4: 保存数据准备结果\n")
+  kegg_preparation_results <- list(
+    gene_lists = gene_lists,
+    quality_report = quality_report,
+    analysis_strategy = analysis_strategy,
+    preparation_timestamp = Sys.time(),
+    pipeline_version = "DESeq2-Trend-WGCNA-KEGG-Preparation"
+  )
+  saveRDS(kegg_preparation_results, "New_Pipeline_KEGG_Preparation_Results.rds")
+  cat("✅ KEGG分析准备结果已保存\n")
+  cat("\n步骤5: 生成数据准备总结报告\n")
+  cat("✅ 第四章：KEGG通路分析数据准备 - 完成！\n")
+  cat("🎯 KEGG分析准备主要成果:\n")
+  cat("• 环境设置: KEGG分析专用工具包加载完成\n")
+  cat("• 质量评估: ", quality_report$quality_assessment, " 等级\n", sep = "")
+  cat("• 注释覆盖度: ", round(quality_report$overall_coverage_rate, 1), "%\n", sep = "")
+  cat("• 最佳KEGG列: ", quality_report$best_kegg_column, "\n", sep = "")
+  cat("• 分析策略: ", analysis_strategy$primary_analysis, "\n", sep = "")
+  if (analysis_strategy$primary_analysis == "RECOMMENDED") {
+    cat("• 重点分析列表: ", length(analysis_strategy$high_priority_lists), " 个\n", sep = "")
+    cat("• 预期成功率: ", analysis_strategy$expected_success_rate, "%\n", sep = "")
+    cat("\n🔬 推荐的重点分析列表:\n")
+    for (list_name in analysis_strategy$high_priority_lists) {
+      score_info <- analysis_strategy$priority_scores[[list_name]]
+      cat("   - ", list_name, " (", round(score_info$coverage_rate, 1), 
+          "% 覆盖度, ", score_info$gene_count, " 基因)\n", sep = "")
+    }
+  } else {
+    cat("\n⚠️ KEGG分析建议:\n")
+    cat("   由于KEGG注释覆盖度过低，建议专注于GO分析结果\n")
+    cat("   备选方案:\n")
+    for (alternative in analysis_strategy$alternative_approaches) {
+      cat("   • ", alternative, "\n", sep = "")
+    }
+  }
+  return(kegg_preparation_results)
+}
+
+if (exists("prepared_data") && !is.null(prepared_data)) {
+  cat("🔍 检测到前期数据准备完成，自动执行KEGG分析准备...\n")
+  kegg_preparation_results <- execute_new_pipeline_kegg_preparation(prepared_data)
+} else {
+  cat("💡 第四章KEGG分析准备模块加载完成！\n")
+  cat("📋 使用方法:\n")
+  cat("   1. 确保已运行第一章并获得prepared_data对象\n")
+  cat("   2. 执行: kegg_prep_results <- execute_new_pipeline_kegg_preparation(prepared_data)\n")
+  cat("   3. 查看KEGG注释质量报告和分析策略\n\n")
+}
+cat("# 第四章第一部分代码加载完成 - KEGG分析数据准备模块就绪\n")
+
+###############################################################################
+# 第四章第二部分：KEGG富集分析执行模块（新流程优化版）
+###############################################################################
+
+### 4.5 KEGG富集分析核心执行器（新流程优化版）
+execute_kegg_enrichment_analysis <- function(kegg_preparation_results) {
+  cat("第四章第二部分：KEGG富集分析执行 - 开始执行\n")
+  cat("=== KEGG富集分析核心执行 ===\n")
+  if (is.null(kegg_preparation_results) || 
+      kegg_preparation_results$analysis_strategy$primary_analysis != "RECOMMENDED") {
+    cat("❌ KEGG分析不可行，跳过执行\n")
+    cat("💡 原因:", kegg_preparation_results$analysis_strategy$reason, "\n")
+    return(NULL)
+  }
+  cat("步骤1: 配置KEGG分析参数和环境...\n")
+  analysis_params <- kegg_preparation_results$analysis_strategy$analysis_parameters
+  best_kegg_column <- kegg_preparation_results$quality_report$best_kegg_column
+  high_priority_lists <- kegg_preparation_results$analysis_strategy$high_priority_lists
+  cat("   使用KEGG列:", best_kegg_column, "\n")
+  cat("   分析参数: p=", analysis_params$pvalue_cutoff, 
+      ", q=", analysis_params$qvalue_cutoff, "\n", sep="")
+  cat("   高优先级列表:", length(high_priority_lists), "个\n")
+  cat("步骤2: 执行高优先级基因列表KEGG分析...\n")
+  kegg_results <- list()
+  gene_lists <- kegg_preparation_results$gene_lists
+  for (list_name in high_priority_lists) {
+    cat("   分析基因列表:", list_name, "... ", sep="")
+    genes <- gene_lists[[list_name]]
+    if (length(genes) >= analysis_params$minGSSize) {
+      kegg_result <- perform_single_kegg_analysis(
+        genes, list_name, best_kegg_column, analysis_params
+      )
+      if (!is.null(kegg_result)) {
+        kegg_results[[list_name]] <- kegg_result
+        cat("成功 (", nrow(kegg_result), " 个通路)\n", sep="")
+      } else {
+        cat("无显著通路\n")
+      }
+    } else {
+      cat("基因数不足\n")
+    }
+  }
+  cat("步骤3: 执行中等优先级基因列表分析...\n")
+  medium_priority_lists <- kegg_preparation_results$analysis_strategy$medium_priority_lists
+  if (length(kegg_results) > 0 && length(medium_priority_lists) > 0) {
+    for (list_name in medium_priority_lists) {
+      cat("   分析基因列表:", list_name, "... ", sep="")
+      genes <- gene_lists[[list_name]]
+      if (length(genes) >= max(5, analysis_params$minGSSize - 5)) {
+        kegg_result <- perform_single_kegg_analysis(
+          genes, list_name, best_kegg_column, analysis_params
+        )
+        if (!is.null(kegg_result)) {
+          kegg_results[[list_name]] <- kegg_result
+          cat("成功 (", nrow(kegg_result), " 个通路)\n", sep="")
+        } else {
+          cat("无显著通路\n")
+        }
+      } else {
+        cat("基因数不足\n")
+      }
+    }
+  }
+  cat("步骤4: KEGG分析结果统计和质量评估...\n")
+  total_analyses <- length(kegg_results)
+  total_pathways <- sum(sapply(kegg_results, nrow))
+  success_rate <- round(total_analyses / length(high_priority_lists) * 100, 1)
+  cat("   分析完成统计:\n")
+  cat("     - 成功分析数:", total_analyses, "/", length(high_priority_lists), "\n")
+  cat("     - 总显著通路数:", total_pathways, "\n")
+  cat("     - 成功率:", success_rate, "%\n")
+  cat("步骤5: 保存初步分析结果...\n")
+  if (length(kegg_results) > 0) {
+    preliminary_results <- list(
+      kegg_results = kegg_results,
+      analysis_params = analysis_params,
+      best_kegg_column = best_kegg_column,
+      gene_lists_analyzed = names(kegg_results),
+      analysis_timestamp = Sys.time()
+    )
+    saveRDS(preliminary_results, "KEGG_Preliminary_Analysis_Results.rds")
+    cat("   ✅ 初步分析结果已保存\n")
+  }
+  cat("✅ KEGG富集分析执行完成\n")
+  return(kegg_results)
+}
+
+### 4.6 单个KEGG分析执行函数（优化版）
+perform_single_kegg_analysis <- function(genes, list_name, kegg_column, analysis_params) {
+  tryCatch({
+    gene_kegg <- AnnotationDbi::select(
+      org.[YourSpecies].eg.db,
+      keys = genes,
+      columns = kegg_column,
+      keytype = "GID"
+    )
+    kegg_ids <- gene_kegg[[kegg_column]]
+    kegg_ids_clean <- clean_kegg_ids(kegg_ids)
+    if (length(kegg_ids_clean) < analysis_params$minGSSize) {
+      return(NULL)
+    }
+    organism_info <- determine_kegg_organism(kegg_ids_clean)
+    kk <- enrichKEGG(
+      gene = kegg_ids_clean,
+      organism = organism_info$organism,
+      keyType = organism_info$keyType,
+      pvalueCutoff = analysis_params$pvalue_cutoff,
+      pAdjustMethod = "BH",
+      qvalueCutoff = analysis_params$qvalue_cutoff,
+      minGSSize = analysis_params$minGSSize,
+      maxGSSize = analysis_params$maxGSSize
+    )
+    if (!is.null(kk) && nrow(kk) > 0) {
+      result_df <- as.data.frame(kk)
+      result_df$GeneList_Name <- list_name
+      result_df$Input_Gene_Count <- length(genes)
+      result_df$KEGG_ID_Count <- length(kegg_ids_clean)
+      result_df$KEGG_Column_Used <- kegg_column
+      result_df$Organism_Used <- organism_info$organism
+      result_df$Analysis_Timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      result_df$Biological_Context <- get_biological_context(list_name)
+      return(result_df)
+    }
+    return(NULL)
+  }, error = function(e) {
+    cat("KEGG分析错误:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+### 4.7 KEGG ID清理和格式统一函数
+clean_kegg_ids <- function(kegg_ids) {
+  kegg_ids <- kegg_ids[!is.na(kegg_ids) & kegg_ids != ""]
+  if (length(kegg_ids) == 0) {
+    return(character(0))
+  }
+  kegg_ids <- gsub("^ko:", "", kegg_ids)
+  kegg_ids <- gsub("^KEGG:", "", kegg_ids)
+  kegg_ids <- gsub("^path:", "", kegg_ids)
+  kegg_ids <- gsub("\\s+", "", kegg_ids)
+  kegg_ids <- gsub("\\[.*\\]", "", kegg_ids)
+  valid_pattern <- "^(K[0-9]+)$"
+  valid_ids <- kegg_ids[grepl(valid_pattern, kegg_ids)]
+  return(unique(valid_ids))
+}
+
+cat("重新执行完整的KEGG分析流程...\n")
+if (!exists("kegg_enrichment_results") || is.null(kegg_enrichment_results)) {
+  cat("使用测试成功的代码执行完整分析...\n")
+  kegg_prep_results <- readRDS("New_Pipeline_KEGG_Preparation_Results.rds")
+  kegg_results <- list()
+  gene_lists <- kegg_prep_results$gene_lists
+  high_priority_lists <- kegg_prep_results$analysis_strategy$high_priority_lists
+  for (list_name in high_priority_lists) {
+    cat("分析基因列表:", list_name, "...\n")
+    genes <- gene_lists[[list_name]]
+    if (length(genes) >= 10) {
+      gene_kegg <- AnnotationDbi::select(
+        org.[YourSpecies].eg.db,
+        keys = genes,
+        columns = "KEGG",
+        keytype = "GID"
+      )
+      kegg_ids_clean <- clean_kegg_ids(gene_kegg$KEGG)
+      if (length(kegg_ids_clean) >= 5) {
+        kk <- enrichKEGG(
+          gene = kegg_ids_clean,
+          organism = "ko",
+          keyType = "kegg", 
+          pvalueCutoff = 0.1,
+          qvalueCutoff = 0.3,
+          minGSSize = 5,
+          maxGSSize = 500
+        )
+        if (!is.null(kk) && nrow(kk) > 0) {
+          result_df <- as.data.frame(kk)
+          result_df$GeneList_Name <- list_name
+          result_df$Input_Gene_Count <- length(genes)
+          result_df$KEGG_ID_Count <- length(kegg_ids_clean)
+          kegg_results[[list_name]] <- result_df
+          cat("  成功: 找到", nrow(result_df), "个显著通路\n")
+        } else {
+          cat("  无显著通路\n")
+        }
+      } else {
+        cat("  KEGG ID数量不足:", length(kegg_ids_clean), "\n")
+      }
+    } else {
+      cat("  基因数量不足:", length(genes), "\n")
+    }
+  }
+  if (length(kegg_results) > 0) {
+    complete_kegg_analysis <- list(
+      preparation_results = kegg_prep_results,
+      enrichment_results = kegg_results,
+      analysis_timestamp = Sys.time(),
+      pipeline_version = "DESeq2-Trend-WGCNA-KEGG-Enrichment-Fixed"
+    )
+    saveRDS(complete_kegg_analysis, "New_Pipeline_Complete_KEGG_Enrichment_Fixed.rds")
+    cat("✅ 完整KEGG分析结果已保存\n")
+    total_analyses <- length(kegg_results)
+    total_pathways <- sum(sapply(kegg_results, nrow))
+    cat("\n🎯 KEGG富集分析最终成果:\n")
+    cat("• 成功分析数量:", total_analyses, "/", length(high_priority_lists), "\n")
+    cat("• 总显著通路数:", total_pathways, "\n")
+    cat("\n🔬 各列表分析结果:\n")
+    for (list_name in names(kegg_results)) {
+      pathway_count <- nrow(kegg_results[[list_name]])
+      cat("  • ", list_name, ": ", pathway_count, " 个显著通路\n", sep="")
+    }
+    kegg_enrichment_results <- complete_kegg_analysis
+  }
+}
+
+### 4.8 KEGG Organism参数智能判断函数
+determine_kegg_organism <- function(kegg_ids) {
+  k_format <- sum(grepl("^K[0-9]+$", kegg_ids))
+  ko_format <- sum(grepl("^ko[0-9]+$", kegg_ids))
+  numeric_format <- sum(grepl("^[0-9]+$", kegg_ids))
+  cat("  KEGG ID格式统计: K格式=", k_format, 
+      ", ko格式=", ko_format, 
+      ", 数字格式=", numeric_format, "\n")
+  if (k_format > 0 || ko_format > 0) {
+    return(list(organism = "ko", keyType = "kegg"))
+  } else if (numeric_format > 0) {
+    return(list(organism = "ko", keyType = "kegg"))
+  } else {
+    return(list(organism = "ko", keyType = "kegg"))
+  }
+}
+
+### 4.9 生物学背景注释函数
+get_biological_context <- function(list_name) {
+  context_map <- list(
+    trend_positive = "行为正相关基因 - 可能促进目标性状的通路",
+    trend_negative = "行为负相关基因 - 可能抑制目标性状的通路",
+    wgcna_key_module = "行为相关共表达模块 - 协同调控的通路网络",
+    wgcna_hub_genes = "网络枢纽基因 - 关键调控通路",
+    high_confidence_overlap = "趋势与WGCNA重叠高置信度基因 - 最可靠的性状相关通路",
+    all_trend_genes = "所有趋势基因 - 综合行为相关通路",
+    all_wgcna_genes = "所有WGCNA基因 - 网络相关通路特征"
+  )
+  return(ifelse(list_name %in% names(context_map), 
+                context_map[[list_name]], 
+                "其他基因集合通路特征"))
+}
+
+### 4.10 KEGG分析执行主函数
+execute_complete_kegg_enrichment <- function(prepared_data) {
+  cat("# 第四章第二部分：KEGG富集分析执行 - 开始执行\n")
+  cat("步骤0: 输入数据验证\n")
+  if (is.null(prepared_data) || is.null(prepared_data$all_gene_lists)) {
+    cat("❌ 错误: 未找到基因列表数据\n")
+    return(NULL)
+  }
+  cat("步骤1: 检查KEGG分析准备状态...\n")
+  if (!file.exists("New_Pipeline_KEGG_Preparation_Results.rds")) {
+    cat("   执行KEGG分析准备...\n")
+    kegg_prep_results <- execute_new_pipeline_kegg_preparation(prepared_data)
+  } else {
+    cat("   加载已有KEGG准备结果...\n")
+    kegg_prep_results <- readRDS("New_Pipeline_KEGG_Preparation_Results.rds")
+  }
+  if (is.null(kegg_prep_results) || 
+      kegg_prep_results$analysis_strategy$primary_analysis != "RECOMMENDED") {
+    cat("
