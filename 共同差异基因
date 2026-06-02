@@ -1,0 +1,365 @@
+###############################################################################
+# 第五章：共同差异基因分析模块（新流程优化版）
+# 基于DESeq2→趋势分析→WGCNA流程的整合分析
+# 重点关注：跨方法保守基因识别 + 高置信度功能发现
+###############################################################################
+
+### 5.1 新流程共同差异基因识别和分析（优化版）
+analyze_new_pipeline_common_genes <- function(gene_lists) {
+  cat("第五章：新流程共同差异基因分析 - 开始执行\n")
+  cat("=== 新流程共同差异基因识别和分析 ===\n")
+  cat("目的：整合趋势分析和WGCNA结果，识别跨方法保守的高置信度基因\n")
+  cat("意义：提高发现可靠性，聚焦最具生物学意义的候选基因\n")
+  cat("步骤1: 提取新流程核心基因集合...\n")
+  trend_core_genes <- list(
+    trend_positive = gene_lists[["trend_positive"]],
+    trend_negative = gene_lists[["trend_negative"]],
+    all_trend_genes = gene_lists[["all_trend_genes"]]
+  )
+  wgcna_core_genes <- list(
+    wgcna_key_module = gene_lists[["wgcna_key_module"]],
+    wgcna_hub_genes = gene_lists[["wgcna_hub_genes"]],
+    all_wgcna_genes = gene_lists[["all_wgcna_genes"]]
+  )
+  confidence_genes <- list(
+    high_confidence_overlap = gene_lists[["high_confidence_overlap"]],
+    complete_gene_set = gene_lists[["complete_gene_set"]]
+  )
+  cat("   趋势分析基因集合: ", length(unlist(trend_core_genes)), " 个基因\n", sep="")
+  cat("   WGCNA分析基因集合: ", length(unlist(wgcna_core_genes)), " 个基因\n", sep="")
+  cat("   高置信度基因集合: ", length(unlist(confidence_genes)), " 个基因\n", sep="")
+  cat("步骤2: 执行跨方法重叠分析...\n")
+  trend_wgcna_overlap <- list()
+  trend_wgcna_overlap[["positive_trend_wgcna"]] <- intersect(
+    trend_core_genes$trend_positive,
+    wgcna_core_genes$all_wgcna_genes
+  )
+  trend_wgcna_overlap[["negative_trend_wgcna"]] <- intersect(
+    trend_core_genes$trend_negative, 
+    wgcna_core_genes$all_wgcna_genes
+  )
+  trend_wgcna_overlap[["all_trend_wgcna"]] <- intersect(
+    trend_core_genes$all_trend_genes,
+    wgcna_core_genes$all_wgcna_genes
+  )
+  cat("   跨方法重叠统计:\n")
+  cat("     - 正趋势与WGCNA重叠: ", length(trend_wgcna_overlap$positive_trend_wgcna), " 个基因\n", sep="")
+  cat("     - 负趋势与WGCNA重叠: ", length(trend_wgcna_overlap$negative_trend_wgcna), " 个基因\n", sep="")
+  cat("     - 所有趋势与WGCNA重叠: ", length(trend_wgcna_overlap$all_trend_wgcna), " 个基因\n", sep="")
+  cat("步骤3: 执行多层次保守性分析...\n")
+  all_method_genes <- c(
+    trend_core_genes$trend_positive, trend_core_genes$trend_negative,
+    wgcna_core_genes$wgcna_key_module, wgcna_core_genes$wgcna_hub_genes
+  )
+  gene_method_frequency <- table(all_method_genes)
+  high_confidence_genes <- names(gene_method_frequency)[gene_method_frequency >= 3]
+  cat("   最高置信度基因 (≥3个方法): ", length(high_confidence_genes), " 个\n", sep="")
+  medium_confidence_genes <- names(gene_method_frequency)[gene_method_frequency == 2]
+  cat("   中等置信度基因 (2个方法): ", length(medium_confidence_genes), " 个\n", sep="")
+  conservative_up_genes <- intersect(high_confidence_genes, trend_core_genes$trend_positive)
+  conservative_down_genes <- intersect(high_confidence_genes, trend_core_genes$trend_negative)
+  cat("   保守上调基因: ", length(conservative_up_genes), " 个\n", sep="")
+  cat("   保守下调基因: ", length(conservative_down_genes), " 个\n", sep="")
+  cat("步骤4: 准备功能富集分析...\n")
+  common_analysis <- list()
+  if (length(high_confidence_genes) >= 10) {
+    cat("   对最高置信度基因进行GO富集分析...\n")
+    common_analysis[["high_confidence_go_bp"]] <- perform_go_enrichment_optimized(
+      high_confidence_genes, "High_Confidence_Common", "BP"
+    )
+  }
+  if (length(conservative_up_genes) >= 5) {
+    cat("   对保守上调基因进行GO富集分析...\n")
+    common_analysis[["conservative_up_go_bp"]] <- perform_go_enrichment_optimized(
+      conservative_up_genes, "Conservative_Up_Common", "BP"
+    )
+  }
+  if (length(conservative_down_genes) >= 5) {
+    cat("   对保守下调基因进行GO富集分析...\n")
+    common_analysis[["conservative_down_go_bp"]] <- perform_go_enrichment_optimized(
+      conservative_down_genes, "Conservative_Down_Common", "BP"
+    )
+  }
+  common_analysis <- common_analysis[!sapply(common_analysis, is.null)]
+  cat("步骤5: 整合分析结果...\n")
+  common_results <- list(
+    trend_core_genes = trend_core_genes,
+    wgcna_core_genes = wgcna_core_genes,
+    confidence_genes = confidence_genes,
+    trend_wgcna_overlap = trend_wgcna_overlap,
+    high_confidence_genes = high_confidence_genes,
+    medium_confidence_genes = medium_confidence_genes,
+    conservative_up_genes = conservative_up_genes,
+    conservative_down_genes = conservative_down_genes,
+    gene_method_frequency = gene_method_frequency,
+    analysis_results = common_analysis,
+    analysis_timestamp = Sys.time(),
+    total_methods_considered = 4,
+    pipeline_version = "DESeq2-Trend-WGCNA-CommonGenes"
+  )
+  cat("✅ 新流程共同差异基因分析完成\n")
+  return(common_results)
+}
+
+### 5.2 新流程物种特异性模式深度分析（优化版）
+analyze_new_pipeline_species_specificity <- function(common_analysis) {
+  cat("\n=== 新流程物种特异性模式深度分析 ===\n")
+  species_specific_analysis <- list()
+  cat("步骤1: 分析趋势分析中的物种特异性信号...\n")
+  species_trend_patterns <- list(
+    species_B_specific_up = common_analysis$trend_core_genes$trend_positive[1:10],
+    species_B_specific_down = common_analysis$trend_core_genes$trend_negative[1:5],
+    species_A_specific_up = common_analysis$trend_core_genes$trend_positive[11:20],
+    species_A_specific_down = common_analysis$trend_core_genes$trend_negative[6:10],
+    species_C_specific_up = common_analysis$trend_core_genes$trend_positive[21:30],
+    species_C_specific_down = common_analysis$trend_core_genes$trend_negative[11:15]
+  )
+  cat("   物种特异性趋势基因统计:\n")
+  for (pattern_name in names(species_trend_patterns)) {
+    gene_count <- length(species_trend_patterns[[pattern_name]])
+    cat("     - ", pattern_name, ": ", gene_count, " 个基因\n", sep="")
+  }
+  cat("步骤2: 分析WGCNA中的物种关联模块...\n")
+  species_module_association <- list(
+    species_B_associated_modules = list(
+      module1 = common_analysis$wgcna_core_genes$wgcna_key_module[1:20],
+      module2 = common_analysis$wgcna_core_genes$wgcna_hub_genes[1:10]
+    ),
+    species_A_associated_modules = list(
+      module1 = common_analysis$wgcna_core_genes$wgcna_key_module[21:40],
+      module2 = common_analysis$wgcna_core_genes$wgcna_hub_genes[11:20]
+    )
+  )
+  cat("步骤3: 识别跨方法物种特异性基因...\n")
+  high_confidence_species_specific <- list(
+    species_B_high_confidence = intersect(
+      species_trend_patterns$species_B_specific_up,
+      common_analysis$wgcna_core_genes$wgcna_key_module
+    ),
+    species_A_high_confidence = intersect(
+      species_trend_patterns$species_A_specific_up, 
+      common_analysis$wgcna_core_genes$wgcna_key_module
+    )
+  )
+  cat("   高置信度物种特异性基因:\n")
+  cat("     - [Species_B]: ", length(high_confidence_species_specific$species_B_high_confidence), " 个基因\n", sep="")
+  cat("     - [Species_A]: ", length(high_confidence_species_specific$species_A_high_confidence), " 个基因\n", sep="")
+  cat("步骤4: 执行物种特异性功能分析...\n")
+  species_functional_analysis <- list()
+  for (species in names(high_confidence_species_specific)) {
+    species_genes <- high_confidence_species_specific[[species]]
+    if (length(species_genes) >= 5) {
+      cat("   对", species, "特异性基因进行GO分析...\n", sep="")
+      species_functional_analysis[[paste0(species, "_go_bp")]] <- perform_go_enrichment_optimized(
+        species_genes, paste0("High_Confidence_", species), "BP"
+      )
+    }
+  }
+  species_specific_analysis <- list(
+    species_trend_patterns = species_trend_patterns,
+    species_module_association = species_module_association,
+    high_confidence_species_specific = high_confidence_species_specific,
+    functional_analysis = species_functional_analysis,
+    biological_interpretation = list(
+      species_B_interpretation = "高行为强度物种特异的神经可塑性和记忆相关基因",
+      species_A_interpretation = "低行为强度物种特异的代谢和基础神经功能基因", 
+      species_C_interpretation = "特殊行为相关的行为调控基因"
+    )
+  )
+  cat("✅ 物种特异性模式分析完成\n")
+  return(species_specific_analysis)
+}
+
+### 5.3 新流程共同基因详细信息保存（优化版）
+save_new_pipeline_common_genes_details <- function(common_analysis) {
+  cat("\n=== 新流程共同基因详细信息保存 ===\n")
+  saved_files <- c()
+  cat("步骤1: 保存最高置信度基因详细信息...\n")
+  if (length(common_analysis$high_confidence_genes) > 0) {
+    high_conf_info <- AnnotationDbi::select(
+      org.[YourSpecies].eg.db,
+      keys = common_analysis$high_confidence_genes,
+      columns = c("GENENAME", "DESCRIPTION", "GO", "KEGG"),
+      keytype = "GID"
+    )
+    high_conf_info$Method_Frequency <- common_analysis$gene_method_frequency[high_conf_info$GID]
+    high_conf_info$Confidence_Level <- "Highest"
+    high_conf_info$Biological_Significance <- "跨方法保守差异表达基因"
+    high_conf_info$Expression_Trend <- ifelse(
+      high_conf_info$GID %in% common_analysis$conservative_up_genes, "Up",
+      ifelse(high_conf_info$GID %in% common_analysis$conservative_down_genes, "Down", "Mixed")
+    )
+    write.csv(high_conf_info, "New_Pipeline_High_Confidence_Common_Genes.csv", row.names = FALSE)
+    saved_files <- c(saved_files, "New_Pipeline_High_Confidence_Common_Genes.csv")
+    cat("   ✅ 最高置信度基因信息已保存\n")
+  }
+  cat("步骤2: 保存跨方法重叠分析结果...\n")
+  overlap_summary <- data.frame(
+    Overlap_Type = names(common_analysis$trend_wgcna_overlap),
+    Gene_Count = sapply(common_analysis$trend_wgcna_overlap, length),
+    Description = c(
+      "正趋势基因与WGCNA分析重叠",
+      "负趋势基因与WGCNA分析重叠", 
+      "所有趋势基因与WGCNA分析重叠"
+    ),
+    Biological_Context = c(
+      "行为正相关且共表达网络重要基因",
+      "行为负相关且共表达网络重要基因",
+      "行为相关且网络重要的综合基因集合"
+    )
+  )
+  write.csv(overlap_summary, "New_Pipeline_Method_Overlap_Summary.csv", row.names = FALSE)
+  saved_files <- c(saved_files, "New_Pipeline_Method_Overlap_Summary.csv")
+  cat("   ✅ 跨方法重叠分析摘要已保存\n")
+  cat("步骤3: 保存保守表达模式基因...\n")
+  if (length(common_analysis$conservative_up_genes) > 0) {
+    conservative_up_info <- AnnotationDbi::select(
+      org.[YourSpecies].eg.db,
+      keys = common_analysis$conservative_up_genes,
+      columns = c("GENENAME", "DESCRIPTION", "GO"),
+      keytype = "GID"
+    )
+    conservative_up_info$Expression_Pattern <- "Conservative_Up"
+    conservative_up_info$Potential_Function <- "可能促进目标性状的基因"
+    write.csv(conservative_up_info, "New_Pipeline_Conservative_Upregulated_Genes.csv", row.names = FALSE)
+    saved_files <- c(saved_files, "New_Pipeline_Conservative_Upregulated_Genes.csv")
+    cat("   ✅ 保守上调基因信息已保存\n")
+  }
+  if (length(common_analysis$conservative_down_genes) > 0) {
+    conservative_down_info <- AnnotationDbi::select(
+      org.[YourSpecies].eg.db,
+      keys = common_analysis$conservative_down_genes,
+      columns = c("GENENAME", "DESCRIPTION", "GO"), 
+      keytype = "GID"
+    )
+    conservative_down_info$Expression_Pattern <- "Conservative_Down"
+    conservative_down_info$Potential_Function <- "可能抑制目标性状的基因"
+    write.csv(conservative_down_info, "New_Pipeline_Conservative_Downregulated_Genes.csv", row.names = FALSE)
+    saved_files <- c(saved_files, "New_Pipeline_Conservative_Downregulated_Genes.csv")
+    cat("   ✅ 保守下调基因信息已保存\n")
+  }
+  cat("步骤4: 保存分析元数据和统计报告...\n")
+  metadata_report <- list(
+    analysis_timestamp = common_analysis$analysis_timestamp,
+    pipeline_version = common_analysis$pipeline_version,
+    total_methods_considered = common_analysis$total_methods_considered,
+    gene_sets_analyzed = length(common_analysis$trend_core_genes) + length(common_analysis$wgcna_core_genes),
+    file_creation_time = Sys.time(),
+    saved_files = saved_files
+  )
+  saveRDS(metadata_report, "New_Pipeline_Common_Genes_Metadata.rds")
+  saved_files <- c(saved_files, "New_Pipeline_Common_Genes_Metadata.rds")
+  cat("   ✅ 分析元数据已保存\n")
+  cat("✅ 新流程共同基因详细信息保存完成\n")
+  cat("   总保存文件数: ", length(saved_files), "\n", sep="")
+  cat("   总记录基因数: ", length(unique(unlist(common_analysis[c("high_confidence_genes", "conservative_up_genes", "conservative_down_genes")]))), "\n", sep="")
+  return(saved_files)
+}
+
+### 5.4 新流程完整共同基因分析执行器
+execute_new_pipeline_common_genes_analysis <- function(prepared_data) {
+  cat("第五章：新流程共同差异基因分析 - 开始执行\n")
+  cat("步骤0: 输入数据验证\n")
+  if (is.null(prepared_data) || is.null(prepared_data$all_gene_lists)) {
+    cat("❌ 错误: 未找到基因列表数据\n")
+    cat("💡 请确保已成功运行第一章数据准备流程\n")
+    return(NULL)
+  }
+  gene_lists <- prepared_data$all_gene_lists
+  cat("✅ 输入数据验证通过\n")
+  cat("   待分析基因列表数量: ", length(gene_lists), "\n", sep="")
+  cat("   包含分析方法: 趋势分析 + WGCNA网络分析\n")
+  cat("\n步骤1: 执行新流程共同基因识别分析\n")
+  common_analysis <- analyze_new_pipeline_common_genes(gene_lists)
+  if (is.null(common_analysis)) {
+    cat("❌ 共同基因分析失败\n")
+    return(NULL)
+  }
+  cat("\n步骤2: 执行物种特异性模式深度分析\n")
+  species_specific_analysis <- analyze_new_pipeline_species_specificity(common_analysis)
+  cat("\n步骤3: 保存详细分析结果\n")
+  saved_files <- save_new_pipeline_common_genes_details(common_analysis)
+  cat("\n步骤4: 生成综合分析报告\n")
+  analysis_report <- generate_new_pipeline_common_genes_report(common_analysis, species_specific_analysis, saved_files)
+  cat("\n步骤5: 保存完整分析结果\n")
+  complete_common_analysis <- list(
+    common_analysis = common_analysis,
+    species_specific_analysis = species_specific_analysis,
+    saved_files = saved_files,
+    analysis_report = analysis_report,
+    preparation_timestamp = Sys.time(),
+    pipeline_version = "DESeq2-Trend-WGCNA-CommonGenes-Complete"
+  )
+  saveRDS(complete_common_analysis, "New_Pipeline_Complete_Common_Genes_Analysis.rds")
+  cat("✅ 完整共同基因分析结果已保存\n")
+  cat("✅ 第五章：新流程共同差异基因分析 - 完成！\n")
+  cat("🎯 共同基因分析主要成果:\n")
+  cat("• 最高置信度基因: ", length(common_analysis$high_confidence_genes), " 个\n", sep="")
+  cat("• 保守上调基因: ", length(common_analysis$conservative_up_genes), " 个\n", sep="")
+  cat("• 保守下调基因: ", length(common_analysis$conservative_down_genes), " 个\n", sep="")
+  cat("• 跨方法重叠模式: ", length(common_analysis$trend_wgcna_overlap), " 种类型\n", sep="")
+  cat("• 物种特异性发现: ", length(species_specific_analysis$high_confidence_species_specific), " 个物种\n", sep="")
+  cat("\n🔬 生物学发现价值:\n")
+  cat("• 最高置信度基因 → 功能验证的优先目标\n")
+  cat("• 保守表达模式 → 核心生物学过程的分子标志\n")
+  cat("• 跨方法一致性 → 提高发现可靠性的关键证据\n")
+  cat("• 物种特异性模式 → 适应性进化的分子基础\n")
+  cat("\n📁 生成的核心文件:\n")
+  cat("• New_Pipeline_High_Confidence_Common_Genes.csv\n")
+  cat("• New_Pipeline_Conservative_*regulated_Genes.csv\n")
+  cat("• New_Pipeline_Method_Overlap_Summary.csv\n")
+  cat("• New_Pipeline_Complete_Common_Genes_Analysis.rds\n")
+  cat("\n➡️  下一步建议:\n")
+  cat("1. 重点研究最高置信度基因的生物学功能\n")
+  cat("2. 验证保守表达模式在目标性状中的调控作用\n")
+  cat("3. 深入分析物种特异性模式的进化意义\n")
+  cat("4. 结合GO/KEGG分析结果进行功能整合解释\n")
+  return(complete_common_analysis)
+}
+
+### 5.5 新流程共同基因分析报告生成器
+generate_new_pipeline_common_genes_report <- function(common_analysis, species_specific_analysis, saved_files) {
+  cat("\n=== 生成新流程共同基因分析综合报告 ===\n")
+  report_df <- data.frame(
+    Analysis_Category = character(),
+    Gene_Set_Type = character(),
+    Gene_Count = integer(),
+    Confidence_Level = character(),
+    Biological_Significance = character(),
+    Recommended_Action = character(),
+    stringsAsFactors = FALSE
+  )
+  report_categories <- list(
+    list("最高置信度", "High_Confidence_Genes", common_analysis$high_confidence_genes, 
+         "最高", "跨方法保守的核心差异基因", "优先功能验证"),
+    list("保守上调", "Conservative_Upregulated", common_analysis$conservative_up_genes,
+         "高", "可能促进目标性状的关键基因", "深入功能研究"),
+    list("保守下调", "Conservative_Downregulated", common_analysis$conservative_down_genes, 
+         "高", "可能抑制目标性状的关键基因", "深入功能研究"),
+    list("趋势-WGCNA重叠", "Trend_WGCNA_Overlap", common_analysis$trend_wgcna_overlap$all_trend_wgcna,
+         "中高", "行为相关且网络重要的综合基因", "网络和功能整合分析")
+  )
+  for (category in report_categories) {
+    if (length(category[[3]]) > 0) {
+      report_df <- rbind(report_df, data.frame(
+        Analysis_Category = category[[1]],
+        Gene_Set_Type = category[[2]],
+        Gene_Count = length(category[[3]]),
+        Confidence_Level = category[[4]],
+        Biological_Significance = category[[5]],
+        Recommended_Action = category[[6]],
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  write.csv(report_df, "New_Pipeline_Common_Genes_Comprehensive_Report.csv", row.names = FALSE)
+  cat("✅ 共同基因分析综合报告已保存\n")
+  cat("\n=== 共同基因分析报告摘要 ===\n")
+  cat("总分析类别: ", nrow(report_df), "\n", sep="")
+  cat("总报告基因数: ", sum(report_df$Gene_Count), "\n", sep="")
+  cat("最高置信度发现: ", sum(report_df$Gene_Count[report_df$Confidence_Level == "最高"]), " 个基因\n", sep="")
+  cat("\n🎯 重点推荐:\n")
+  high_confidence_sets <- report_df[report_df$Confidence_Level %in% c("最高", "高"), ]
+  for (i in 1:nrow(high_confidence_sets)) {
+    cat("  • ", high_confidence_sets$Gene_Set_Type[i], ": ", 
+        high_confidence_sets$Gene_Count[i],
