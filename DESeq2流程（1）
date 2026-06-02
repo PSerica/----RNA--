@@ -856,3 +856,428 @@ plot_top_genes_enhanced <- function(gene_counts, species_involved, title, max_ge
   # 定义物种颜色映射
   species_colors_custom <- c(
     "[Genus_species_C]" = "#F0A73A",    # [Species_C] - 橙黄色
+    "[Genus_species_A]" = "#3ABF99",                # [Species_A] - 青绿色  
+    "[Genus_species_B]" = "#2C91E0"           # [Species_B] - 钢蓝色
+  )
+  # 动态选择颜色：只包含当前图表中实际出现的物种
+  # 意义：避免在颜色映射中出现不存在的物种，防止ggplot2警告
+  present_species <- unique(plot_data$species)
+  current_colors <- species_colors_custom[as.character(present_species)]
+  # 绘制箱线图
+  p <- ggplot(plot_data, aes(x = species, y = value, fill = species)) +
+    geom_boxplot(alpha = 0.8) +
+    geom_point(position = position_jitter(width = 0.2), size = 0.8, alpha = 0.6) +
+    facet_wrap(~ Var1, scales = "free_y", ncol = 2) +
+    theme_bw() +
+    scale_fill_manual(values = current_colors) +  # 应用动态选择的颜色
+    labs(title = title, 
+         x = "Species", 
+         y = "Normalized Expression",
+         subtitle = sprintf("Top %d significant DEGs", genes_to_show)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(face = "bold", size = 12),
+          plot.subtitle = element_text(color = "gray40"),
+          legend.position = "none")  # 移除图例，x轴已显示物种名称
+  return(p)
+}
+# 绘制关键基因表达图
+cat("\n正在生成关键基因表达可视化...\n")
+comparison_settings <- list(
+  list(data = top_genes_data$counts_data$B_vs_A, 
+       species = c("[Genus_species_B]", "[Genus_species_A]"),
+       title = "Key Genes: [Species_B] vs [Species_A]"),
+  list(data = top_genes_data$counts_data$B_vs_C,
+       species = c("[Genus_species_B]", "[Genus_species_C]"), 
+       title = "Key Genes: [Species_B] vs [Species_C]"),
+  list(data = top_genes_data$counts_data$A_vs_B,
+       species = c("[Genus_species_A]", "[Genus_species_B]"),
+       title = "Key Genes: [Species_A] vs [Species_B]"),
+  list(data = top_genes_data$counts_data$A_vs_C,
+       species = c("[Genus_species_A]", "[Genus_species_C]"),
+       title = "Key Genes: [Species_A] vs [Species_C]"),
+  list(data = top_genes_data$counts_data$C_vs_B,
+       species = c("[Genus_species_C]", "[Genus_species_B]"),
+       title = "Key Genes: [Species_C] vs [Species_B]"),
+  list(data = top_genes_data$counts_data$C_vs_A,
+       species = c("[Genus_species_C]", "[Genus_species_A]"),
+       title = "Key Genes: [Species_C] vs [Species_A]"),
+  # 三组比较：展示所有三个物种
+  list(data = top_genes_data$counts_data$three_group,
+       species = c("[Genus_species_B]", "[Genus_species_A]", "[Genus_species_C]"),
+       title = "Key Genes: Three-Species Comparison")
+)
+# 生成所有图表
+key_gene_plots <- list()
+for(i in 1:length(comparison_settings)) {
+  cat(sprintf("  生成图表 %d/7...\n", i))
+  setting <- comparison_settings[[i]]
+  plot <- plot_top_genes_enhanced(setting$data, setting$species, setting$title)
+  if(!is.null(plot)) {
+    key_gene_plots[[i]] <- plot
+    print(plot)
+    plot_filename <- paste0("Key_Genes_Plot_", gsub(" ", "_", setting$title), ".png")
+    ggsave(plot_filename, plot, width = 10, height = 8, dpi = 300)
+    cat(sprintf("    图表已保存: %s\n", plot_filename))
+  }
+}
+cat("✅ 关键基因可视化完成\n")
+
+### 2. 跨比较组保守差异基因分析 ------------------------------------------------
+analyze_conserved_genes <- function() {
+  cat("正在分析跨比较组保守差异基因...\n")
+  sig_genes_list <- list(
+    B_vs_A = rownames(results_B_vs_A)[which(results_B_vs_A$padj < 0.05 & !is.na(results_B_vs_A$padj))],
+    B_vs_C = rownames(results_B_vs_C)[which(results_B_vs_C$padj < 0.05 & !is.na(results_B_vs_C$padj))],
+    A_vs_B = rownames(results_A_vs_B)[which(results_A_vs_B$padj < 0.05 & !is.na(results_A_vs_B$padj))],
+    A_vs_C = rownames(results_A_vs_C)[which(results_A_vs_C$padj < 0.05 & !is.na(results_A_vs_C$padj))],
+    C_vs_B = rownames(results_C_vs_B)[which(results_C_vs_B$padj < 0.05 & !is.na(results_C_vs_B$padj))],
+    C_vs_A = rownames(results_C_vs_A)[which(results_C_vs_A$padj < 0.05 & !is.na(results_C_vs_A$padj))],
+    three_group = rownames(results_three_group_lrt)[which(results_three_group_lrt$padj < 0.05 & !is.na(results_three_group_lrt$padj))]
+  )
+  cat("\n>>> 各比较组显著基因数量统计:\n")
+  for (name in names(sig_genes_list)) {
+    cat(sprintf("  %-25s: %5d 个显著基因\n", name, length(sig_genes_list[[name]])))
+  }
+  cat("\n>>> 保守性分析:\n")
+  common_all_comparisons <- Reduce(intersect, sig_genes_list)
+  cat(sprintf("  在所有7个比较中都显著的基因: %d 个 (最高保守性)\n", length(common_all_comparisons)))
+  gene_frequency <- table(unlist(sig_genes_list))
+  common_at_least_four <- names(gene_frequency[gene_frequency >= 4])
+  cat(sprintf("  在至少4个比较中显著的基因: %d 个 (高保守性)\n", length(common_at_least_four)))
+  common_at_least_three <- names(gene_frequency[gene_frequency >= 3])
+  cat(sprintf("  在至少3个比较中显著的基因: %d 个 (中等保守性)\n", length(common_at_least_three)))
+  all_sig_genes <- unique(unlist(sig_genes_list))
+  cat(sprintf("  所有显著基因的并集: %d 个唯一基因\n", length(all_sig_genes)))
+  if (length(common_all_comparisons) > 0) {
+    write.csv(data.frame(GeneID = common_all_comparisons, Conservation_Level = "All_7_Comparisons"), 
+              "Conservative_Genes_All_Comparisons.csv", row.names = FALSE)
+  }
+  if (length(common_at_least_four) > 0) {
+    write.csv(data.frame(GeneID = common_at_least_four, Frequency = as.numeric(gene_frequency[common_at_least_four]), Conservation_Level = "At_Least_4_Comparisons"), 
+              "Conservative_Genes_High_Frequency.csv", row.names = FALSE)
+  }
+  if (length(common_at_least_three) > 0) {
+    write.csv(data.frame(GeneID = common_at_least_three, Frequency = as.numeric(gene_frequency[common_at_least_three]), Conservation_Level = "At_Least_3_Comparisons"), 
+              "Conservative_Genes_Medium_Frequency.csv", row.names = FALSE)
+  }
+  conservation_summary <- data.frame(
+    Conservation_Level = c("All_7", "At_Least_4", "At_Least_3", "All_Significant"),
+    Gene_Count = c(length(common_all_comparisons), length(common_at_least_four), 
+                   length(common_at_least_three), length(all_sig_genes)),
+    Percentage_Of_All = round(c(
+      length(common_all_comparisons) / length(all_sig_genes) * 100,
+      length(common_at_least_four) / length(all_sig_genes) * 100,
+      length(common_at_least_three) / length(all_sig_genes) * 100,
+      100
+    ), 2)
+  )
+  print(conservation_summary)
+  return(list(
+    all_comparisons = common_all_comparisons,
+    at_least_four = common_at_least_four,
+    at_least_three = common_at_least_three,
+    all_genes = all_sig_genes,
+    frequency = gene_frequency,
+    summary = conservation_summary
+  ))
+}
+conserved_genes_results <- analyze_conserved_genes()
+cat("✅ 保守差异基因分析完成\n")
+
+### 3. 物种特异性高变异基因分析 ------------------------------------------------
+analyze_highly_variable_genes <- function() {
+  cat("正在分析高变异基因...\n")
+  species_means <- t(apply(counts(dds, normalized = TRUE), 1, 
+                           function(x) tapply(x, colData(dds)$species, mean)))
+  gene_variance_cv <- apply(species_means, 1, function(x) {
+    if(mean(x) == 0) return(0)
+    sd(x) / mean(x)
+  })
+  gene_variance_all <- apply(counts(dds, normalized = TRUE), 1, function(x) {
+    if(mean(x) == 0) return(0)
+    sd(x) / mean(x)
+  })
+  gene_variance_cv <- gene_variance_cv[is.finite(gene_variance_cv) & !is.na(gene_variance_cv)]
+  gene_variance_all <- gene_variance_all[is.finite(gene_variance_all) & !is.na(gene_variance_all)]
+  top_50_hvg_cv <- names(sort(gene_variance_cv, decreasing = TRUE))[1:50]
+  top_50_hvg_all <- names(sort(gene_variance_all, decreasing = TRUE))[1:50]
+  top_hvg_union <- unique(c(top_50_hvg_cv, top_50_hvg_all))
+  cat(sprintf("  筛选出 %d 个高变异基因\n", length(top_hvg_union)))
+  top_variable_counts <- counts(dds, normalized = TRUE)[top_hvg_union, ]
+  high_var_genes_df <- data.frame(
+    GeneID = top_hvg_union,
+    CV_Species = gene_variance_cv[top_hvg_union],
+    CV_All = gene_variance_all[top_hvg_union],
+    CV_Rank_Species = match(top_hvg_union, names(sort(gene_variance_cv, decreasing = TRUE))),
+    CV_Rank_All = match(top_hvg_union, names(sort(gene_variance_all, decreasing = TRUE)))
+  )
+  high_var_genes_df <- high_var_genes_df[order(-high_var_genes_df$CV_Species), ]
+  write.csv(high_var_genes_df, "Highly_Variable_Genes_Detailed.csv", row.names = FALSE)
+  write.csv(data.frame(GeneID = top_hvg_union), "Highly_Variable_Genes_Simple.csv", row.names = FALSE)
+  hvg_conserved_overlap <- intersect(top_hvg_union, conserved_genes_results$at_least_three)
+  cat(sprintf("  高变异基因与保守基因重叠数: %d (%.1f%%)\n",
+              length(hvg_conserved_overlap),
+              length(hvg_conserved_overlap) / length(top_hvg_union) * 100))
+  return(list(
+    genes = top_hvg_union,
+    counts = top_variable_counts,
+    variance_cv = gene_variance_cv,
+    variance_all = gene_variance_all,
+    details = high_var_genes_df,
+    conserved_overlap = hvg_conserved_overlap
+  ))
+}
+high_var_genes <- analyze_highly_variable_genes()
+cat("✅ 高变异基因分析完成\n")
+
+### 3.5 高变异基因可视化 ###
+plot_highly_variable_genes <- function(gene_counts, num_genes = 8, title_suffix = "Highly Variable Genes") {
+  if(nrow(gene_counts) == 0) {
+    cat("  跳过: 没有可用的基因表达数据\n")
+    return(NULL)
+  }
+  if (!exists("SPECIES_COLORS")) {
+    cat("⚠️ SPECIES_COLORS未定义，使用默认颜色\n")
+    SPECIES_COLORS <- c(
+      "[Genus_species_C]" = "#F0A73A",
+      "[Genus_species_A]" = "#3ABF99",
+      "[Genus_species_B]" = "#2C91E0"
+    )
+  }
+  genes_to_plot <- min(num_genes, nrow(gene_counts))
+  gene_data <- gene_counts[1:genes_to_plot, , drop = FALSE]
+  gene_data_matrix <- as.matrix(gene_data)
+  plot_data <- reshape2::melt(gene_data_matrix, 
+                              varnames = c("Gene", "Sample"),
+                              value.name = "Expression")
+  sample_info <- as.data.frame(colData(dds))
+  sample_info$Sample <- rownames(sample_info)
+  plot_data <- merge(plot_data, sample_info, by = "Sample", all.x = TRUE)
+  if (any(is.na(plot_data$species))) {
+    warning("部分样本信息合并失败，请检查样本名称")
+  }
+  p <- ggplot(plot_data, aes(x = species, y = Expression, fill = species)) +
+    geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.2, size = 1.0, alpha = 0.6, height = 0) +
+    facet_wrap(~ Gene, scales = "free_y", ncol = 2) +
+    theme_bw() +
+    scale_fill_manual(values = SPECIES_COLORS) +
+    labs(title = paste("Top", title_suffix),
+         x = "Species", 
+         y = "Normalized Expression",
+         subtitle = sprintf("Top %d variable genes", genes_to_plot)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(face = "bold", size = 12),
+          plot.subtitle = element_text(color = "gray40"),
+          legend.position = "none")
+  return(p)
+}
+cat("\n正在生成高变异基因可视化...\n")
+hvg_plot <- plot_highly_variable_genes(high_var_genes$counts, 8, "Highly Variable Genes")
+if(!is.null(hvg_plot)) {
+  print(hvg_plot)
+  ggsave("results/Visualization/High_Variable_Genes_Expression.png", 
+         hvg_plot, width = 10, height = 8, dpi = 300)
+  cat("✅ 高变异基因可视化完成并已保存\n")
+}
+
+### 4. 高级分析综合报告 --------------------------------------------------------
+generate_advanced_analysis_report <- function() {
+  cat("正在生成高级分析综合报告...\n\n")
+  cat("🎯 关键发现汇总:\n")
+  cat("========================================\n")
+  total_extreme_genes <- sum(sapply(top_genes_data$extreme_significant, nrow))
+  total_large_effect <- sum(sapply(top_genes_data$large_effect, nrow))
+  cat(sprintf("• 发现 %d 个极显著差异基因 (padj < 1e-10)\n", total_extreme_genes))
+  cat(sprintf("• 识别 %d 个大效应值差异基因 (|log2FC| > 2)\n", total_large_effect))
+  cat(sprintf("• 找到 %d 个在所有比较中保守的差异基因\n", length(conserved_genes_results$all_comparisons)))
+  cat(sprintf("• 发现 %d 个在多个比较中重复出现的差异基因\n", length(conserved_genes_results$at_least_three)))
+  cat(sprintf("• 确定 %d 个在物种间表达变异最大的基因\n", length(high_var_genes$genes)))
+  cat(sprintf("• 高变异基因与保守基因重叠: %d 个\n", length(high_var_genes$conserved_overlap)))
+  cat("\n🔬 生物学意义阐释:\n")
+  cat("========================================\n")
+  cat("• 保守差异基因: 可能反映物种共有的核心适应性进化特征\n")
+  cat("• 高变异基因: 可能参与物种特异的生物学过程或经历快速进化\n") 
+  cat("• 极显著基因: 为功能验证实验提供高可信度的候选基因\n")
+  cat("• 大效应值基因: 可能产生重要生物学影响的潜在关键调控因子\n")
+  cat("\n📊 分析质量评估:\n")
+  cat("========================================\n")
+  if(length(conserved_genes_results$all_comparisons) > 0) {
+    cat("✅ 发现跨比较组保守基因，表明分析具有生物学一致性\n")
+  }
+  if(length(high_var_genes$conserved_overlap) > 0) {
+    cat("✅ 高变异基因与保守基因存在重叠，支持结果的生物学相关性\n")
+  }
+  if(total_extreme_genes > 0) {
+    cat("✅ 检测到极显著差异基因，表明分析具有高统计效力\n")
+  }
+  cat("\n💡 后续研究建议:\n")
+  cat("========================================\n")
+  cat("1. 优先验证保守差异基因的功能重要性\n")
+  cat("2. 深入研究高变异基因的物种特异性功能\n") 
+  cat("3. 结合GO/KEGG富集分析揭示生物学通路\n")
+  cat("4. 对极显著基因进行实验验证和功能表征\n")
+  cat("\n📁 生成的核心文件:\n")
+  cat("========================================\n")
+  cat("• 关键基因表达可视化图表 (7张)\n")
+  cat("• Conservative_Genes_All_Comparisons.csv - 最高保守性基因\n")
+  cat("• Conservative_Genes_High_Frequency.csv - 高频率保守基因\n")
+  cat("• Conservative_Genes_Medium_Frequency.csv - 中等频率保守基因\n")
+  cat("• Highly_Variable_Genes_Detailed.csv - 详细高变异基因信息\n")
+  cat("• Highly_Variable_Genes_Simple.csv - 简化高变异基因列表\n")
+  cat("• 高变异基因表达可视化图表 (1张)\n")
+  cat("🎉 高级分析与生物学解释圆满完成！\n")
+}
+generate_advanced_analysis_report()
+cat("✅ 第四部分：高级分析与生物学解释全部完成！\n")
+
+### 第五部分：数据整合与下游分析准备 ------------------------------------------
+  ### 5.1 全结果整合与导出 ------------------------------------------------------
+combine_all_results_comprehensive <- function() {
+  cat("正在整合所有比较组结果...\n")
+  all_results_combined <- rbind(
+    final_B_vs_A,
+    final_B_vs_C,
+    final_A_vs_B, 
+    final_A_vs_C,
+    final_C_vs_B,
+    final_C_vs_A,
+    final_three_group
+  )
+  write.csv(all_results_combined, "DESeq2_All_Comparisons_Combined.csv", row.names = FALSE)
+  cat("✅ 所有比较组结果已合并保存\n")
+  cat("   文件: DESeq2_All_Comparisons_Combined.csv\n")
+  cat("   总行数:", nrow(all_results_combined), "\n")
+  cat("   包含: 6个两两比较 + 1个三组比较\n")
+  return(all_results_combined)
+}
+all_combined_results <- combine_all_results_comprehensive()
+
+  ### 5.2 核心数据矩阵导出 ------------------------------------------------------
+export_core_data_matrices <- function() {
+  cat("正在导出核心数据矩阵...\n")
+  normalized_counts <- counts(dds, normalized = TRUE)
+  write.csv(normalized_counts, "Normalized_Counts_Matrix.csv")
+  cat("✅ 标准化计数矩阵已保存: Normalized_Counts_Matrix.csv\n")
+  cat("   维度:", paste(dim(normalized_counts), collapse = " x "), "\n")
+  raw_counts_filtered <- counts(dds)
+  write.csv(raw_counts_filtered, "Raw_Counts_Filtered_Matrix.csv")
+  cat("✅ 过滤后原始计数矩阵已保存: Raw_Counts_Filtered_Matrix.csv\n")
+  if(exists("vsd")) {
+    vst_counts <- assay(vsd)
+    write.csv(vst_counts, "VST_Transformed_Counts_Matrix.csv")
+    cat("✅ VST转换计数矩阵已保存: VST_Transformed_Counts_Matrix.csv\n")
+  }
+}
+export_core_data_matrices()
+
+  ### 5.3 下游分析专用文件准备 --------------------------------------------------
+prepare_downstream_analysis_files <- function() {
+  cat("正在为下游分析准备专用文件...\n")
+  downstream_dirs <- c("GO_Analysis", "Pathway_Analysis", "Network_Analysis", "Visualization")
+  for(dir in downstream_dirs) {
+    if (!dir.exists(dir)) {
+      dir.create(dir)
+      cat("   创建目录:", dir, "/\n")
+    }
+  }
+  cat(">>> 准备GO富集分析文件...\n")
+  saveRDS(gene_lists, "GO_Analysis/All_Gene_Lists.rds")
+  cat("   ✅ 完整基因列表对象: GO_Analysis/All_Gene_Lists.rds\n")
+  comparisons <- names(gene_lists)
+  for(comp in comparisons) {
+    genes <- gene_lists[[comp]]
+    if(length(genes) > 0) {
+      gene_df <- data.frame(GeneID = genes)
+      write.csv(gene_df, paste0("GO_Analysis/", comp, "_genes.csv"), row.names = FALSE)
+    }
+  }
+  cat("   ✅ 各比较组基因列表文件已生成\n")
+  cat(">>> 准备通路分析文件...\n")
+  background_genes <- rownames(dds)
+  write.csv(data.frame(GeneID = background_genes), "Pathway_Analysis/Background_Genes.csv", row.names = FALSE)
+  cat("   ✅ 背景基因集: Pathway_Analysis/Background_Genes.csv\n")
+  if(exists("conserved_genes_results")) {
+    write.csv(data.frame(GeneID = conserved_genes_results$at_least_three), 
+              "Pathway_Analysis/Conservative_DEGs.csv", row.names = FALSE)
+    cat("   ✅ 保守差异基因列表: Pathway_Analysis/Conservative_DEGs.csv\n")
+  }
+  cat(">>> 准备共表达网络分析文件...\n")
+  if(exists("high_var_genes")) {
+    hvg_expression <- counts(dds, normalized = TRUE)[high_var_genes$genes, ]
+    write.csv(hvg_expression, "Network_Analysis/High_Variable_Genes_Expression.csv")
+    cat("   ✅ 高变异基因表达矩阵: Network_Analysis/High_Variable_Genes_Expression.csv\n")
+  }
+  sample_info_df <- as.data.frame(colData(dds))
+  write.csv(sample_info_df, "Network_Analysis/Sample_Information.csv")
+  cat("   ✅ 样本信息表: Network_Analysis/Sample_Information.csv\n")
+}
+prepare_downstream_analysis_files()
+
+  ### 5.4 分析可重复性保障 ------------------------------------------------------
+create_reproducibility_docs <- function() {
+  cat("正在创建可重复性文档...\n")
+  analysis_metadata <- data.frame(
+    Analysis_ID = "[Project_ID]",
+    Analysis_Date = as.character(Sys.Date()),
+    R_Version = R.version.string,
+    DESeq2_Version = as.character(packageVersion("DESeq2")),
+    Total_Samples = ncol(dds),
+    Total_Genes_Initial = nrow(counts_data),
+    Total_Genes_Filtered = nrow(dds),
+    Filtering_Criteria = "rowSums(counts >= 10) >= 3",
+    Species_Compared = "[Species_A], [Species_B], [Species_C]",
+    Comparisons_Performed = "6 pairwise + 1 three-group LRT",
+    Significance_Threshold = "padj < 0.05 & |log2FoldChange| > 1",
+    Normalization_Method = "DESeq2 median of ratios",
+    Statistical_Test = "Wald test (pairwise), LRT (three-group)"
+  )
+  write.csv(analysis_metadata, "Analysis_Metadata_Detailed.csv", row.names = FALSE)
+  cat("✅ 详细分析元数据: Analysis_Metadata_Detailed.csv\n")
+  file_structure <- data.frame(
+    Directory = c("GO_Analysis/", "Pathway_Analysis/", "Network_Analysis/", "Visualization/", "./"),
+    Content_Type = c("Gene lists", "Pathway analysis", "Network data", "Visualization", "Core results"),
+    Key_Files = c("All_Gene_Lists.rds, *genes.csv", "Background_Genes.csv, Conservative_DEGs.csv", 
+                  "High_Variable_Genes_Expression.csv, Sample_Information.csv", 
+                  "Plots", "Combined results, count matrices")
+  )
+  write.csv(file_structure, "Project_Directory_Guide.csv", row.names = FALSE)
+  cat("✅ 项目目录指南: Project_Directory_Guide.csv\n")
+  saveRDS(dds, "DESeq2_Analysis_Object.rds")
+  cat("✅ DESeq2分析对象: DESeq2_Analysis_Object.rds\n")
+}
+create_reproducibility_docs()
+
+  ### 5.5 项目完成总结报告 ------------------------------------------------------
+generate_project_completion_report <- function() {
+  cat("正在生成项目完成报告...\n\n")
+  cat("🎉 DESeq2差异表达分析项目圆满完成！\n")
+  cat("📊 项目成果概览:\n")
+  cat("----------------------------------------\n")
+  cat("• 数据规模: ", ncol(dds), "个样本 × ", nrow(dds), "个基因\n")
+  cat("• 比较分析: 6个物种两两比较 + 1个三组整体比较\n")
+  cat("• 差异基因: 通过多层次筛选识别关键候选基因\n")
+  cat("• 质量控制: 完整的质控流程和可视化验证\n")
+  cat("• 生物学洞察: 保守基因、高变异基因等模式发现\n\n")
+  cat("📁 生成文件结构:\n")
+  cat("----------------------------------------\n")
+  cat("├── 核心结果文件\n")
+  cat("│   ├── DESeq2_All_Comparisons_Combined.csv\n")
+  cat("│   ├── Normalized_Counts_Matrix.csv\n")
+  cat("│   └── Raw_Counts_Filtered_Matrix.csv\n")
+  cat("├── GO_Analysis/\n")
+  cat("├── Pathway_Analysis/\n")
+  cat("├── Network_Analysis/\n")
+  cat("└── 可重复性文档\n")
+  cat("    ├── Analysis_Metadata_Detailed.csv\n")
+  cat("    ├── Project_Directory_Guide.csv\n")
+  cat("    └── DESeq2_Analysis_Object.rds\n\n")
+  cat("🔬 后续分析建议:\n")
+  cat("----------------------------------------\n")
+  cat("1. 功能富集分析\n")
+  cat("2. 共表达网络分析 (WGCNA)\n")
+  cat("3. 进化生物学分析\n")
+  cat("4. 实验验证设计\n\n")
+  cat("✅ 项目完成！\n")
+}
+generate_project_completion_report()
