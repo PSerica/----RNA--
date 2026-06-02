@@ -1,0 +1,297 @@
+###############################################################################
+# 第六章：物种特异性基因分析模块（新流程优化版）
+# 基于DESeq2→趋势分析→WGCNA流程的物种特异性模式发现
+# 重点关注：物种特异表达基因 + 行为适应分子基础
+###############################################################################
+
+### 6.1 新流程物种特异性基因识别（优化版）
+analyze_new_pipeline_species_specific_genes <- function(gene_lists) {
+  cat("第六章：新流程物种特异性基因分析 - 开始执行\n")
+  cat("=== 新流程物种特异性基因识别 ===\n")
+  cat("步骤1: 提取新流程核心分析结果...\n")
+  trend_species_patterns <- list(
+    species_B_enhanced = gene_lists[["trend_positive"]],
+    species_B_suppressed = gene_lists[["trend_negative"]],
+    all_trend_background = gene_lists[["all_trend_genes"]]
+  )
+  wgcna_species_patterns <- list(
+    species_B_associated = gene_lists[["wgcna_key_module"]],
+    network_hubs = gene_lists[["wgcna_hub_genes"]],
+    all_wgcna_background = gene_lists[["all_wgcna_genes"]]
+  )
+  cat("   趋势分析基因:", length(unlist(trend_species_patterns)), "个\n")
+  cat("   WGCNA分析基因:", length(unlist(wgcna_species_patterns)), "个\n")
+  cat("步骤2: 计算物种特异性得分...\n")
+  species_specificity <- calculate_species_specificity_scores(
+    trend_species_patterns, wgcna_species_patterns)
+  cat("步骤3: 识别各物种高特异性基因...\n")
+  species_specific_genes <- identify_high_specificity_genes(species_specificity)
+  cat("步骤4: 执行物种特异性功能分析...\n")
+  functional_analysis <- perform_species_specific_functional_analysis(species_specific_genes)
+  species_analysis_results <- list(
+    trend_patterns = trend_species_patterns,
+    wgcna_patterns = wgcna_species_patterns,
+    specificity_scores = species_specificity,
+    specific_genes = species_specific_genes,
+    functional_analysis = functional_analysis,
+    analysis_timestamp = Sys.time(),
+    pipeline_version = "DESeq2-Trend-WGCNA-SpeciesSpecific"
+  )
+  cat("✅ 新流程物种特异性基因分析完成\n")
+  return(species_analysis_results)
+}
+
+### 6.2 物种特异性得分计算函数（新流程优化版）
+calculate_species_specificity_scores <- function(trend_patterns, wgcna_patterns) {
+  cat("   计算物种特异性得分...\n")
+  all_genes <- unique(c(unlist(trend_patterns), unlist(wgcna_patterns)))
+  specificity_scores <- data.frame(
+    GeneID = all_genes,
+    Species_B_Score = 0,
+    Species_A_Score = 0, 
+    Species_C_Score = 0,
+    Max_Species = "",
+    Specificity_Level = "",
+    stringsAsFactors = FALSE
+  )
+  species_B_trend_genes <- trend_patterns$species_B_enhanced
+  specificity_scores$Species_B_Score[specificity_scores$GeneID %in% species_B_trend_genes] <- 
+    specificity_scores$Species_B_Score[specificity_scores$GeneID %in% species_B_trend_genes] + 2
+  wgcna_key_genes <- wgcna_patterns$species_B_associated
+  specificity_scores$Species_B_Score[specificity_scores$GeneID %in% wgcna_key_genes] <- 
+    specificity_scores$Species_B_Score[specificity_scores$GeneID %in% wgcna_key_genes] + 2
+  hub_genes <- wgcna_patterns$network_hubs
+  specificity_scores$Species_B_Score[specificity_scores$GeneID %in% hub_genes] <- 
+    specificity_scores$Species_B_Score[specificity_scores$GeneID %in% hub_genes] + 1
+  for (i in 1:nrow(specificity_scores)) {
+    scores <- c(specificity_scores$Species_B_Score[i],
+                specificity_scores$Species_A_Score[i],
+                specificity_scores$Species_C_Score[i])
+    max_score <- max(scores)
+    if (max_score > 0) {
+      species_names <- c("Species_B", "Species_A", "Species_C")
+      specificity_scores$Max_Species[i] <- species_names[which.max(scores)]
+      if (max_score >= 3) {
+        specificity_scores$Specificity_Level[i] <- "High"
+      } else if (max_score >= 2) {
+        specificity_scores$Specificity_Level[i] <- "Medium"
+      } else {
+        specificity_scores$Specificity_Level[i] <- "Low"
+      }
+    }
+  }
+  high_specific <- sum(specificity_scores$Specificity_Level == "High")
+  medium_specific <- sum(specificity_scores$Specificity_Level == "Medium")
+  cat("   特异性基因统计:\n")
+  cat("     - 高特异性基因:", high_specific, "\n")
+  cat("     - 中等特异性基因:", medium_specific, "\n")
+  cat("     - 总评分基因:", nrow(specificity_scores), "\n")
+  return(specificity_scores)
+}
+
+### 6.3 高特异性基因识别函数（新流程优化版）
+identify_high_specificity_genes <- function(specificity_scores) {
+  cat("   识别高特异性基因集合...\n")
+  high_specific_genes <- list()
+  species_B_high <- specificity_scores$GeneID[
+    specificity_scores$Max_Species == "Species_B" & 
+      specificity_scores$Specificity_Level == "High"
+  ]
+  species_A_high <- specificity_scores$GeneID[
+    specificity_scores$Max_Species == "Species_A" & 
+      specificity_scores$Specificity_Level == "High"
+  ]
+  species_C_high <- specificity_scores$GeneID[
+    specificity_scores$Max_Species == "Species_C" & 
+      specificity_scores$Specificity_Level == "High"
+  ]
+  high_specific_genes <- list(
+    species_B_high = species_B_high,
+    species_A_high = species_A_high,
+    species_C_high = species_C_high,
+    all_high_specific = unique(c(species_B_high, species_A_high, species_C_high)),
+    counts = c(
+      Species_B = length(species_B_high),
+      Species_A = length(species_A_high),
+      Species_C = length(species_C_high),
+      Total = length(unique(c(species_B_high, species_A_high, species_C_high)))
+    )
+  )
+  cat("   高特异性基因统计:\n")
+  cat("     - [Species_B]:", high_specific_genes$counts["Species_B"], "个\n")
+  cat("     - [Species_A]:", high_specific_genes$counts["Species_A"], "个\n")
+  cat("     - [Species_C]:", high_specific_genes$counts["Species_C"], "个\n")
+  cat("     - 总计:", high_specific_genes$counts["Total"], "个\n")
+  return(high_specific_genes)
+}
+
+### 6.4 物种特异性功能分析函数（新流程优化版）
+perform_species_specific_functional_analysis <- function(species_specific_genes) {
+  cat("   执行物种特异性功能分析...\n")
+  functional_results <- list()
+  if (length(species_specific_genes$species_B_high) >= 10) {
+    cat("   分析[Species_B]特异性基因功能...\n")
+    functional_results[["species_B_go_bp"]] <- perform_go_enrichment_optimized(
+      species_specific_genes$species_B_high, "Species_B_High_Specific", "BP"
+    )
+  }
+  if (length(species_specific_genes$species_A_high) >= 10) {
+    cat("   分析[Species_A]特异性基因功能...\n")
+    functional_results[["species_A_go_bp"]] <- perform_go_enrichment_optimized(
+      species_specific_genes$species_A_high, "Species_A_High_Specific", "BP"
+    )
+  }
+  if (length(species_specific_genes$species_C_high) >= 10) {
+    cat("   分析[Species_C]特异性基因功能...\n")
+    functional_results[["species_C_go_bp"]] <- perform_go_enrichment_optimized(
+      species_specific_genes$species_C_high, "Species_C_High_Specific", "BP"
+    )
+  }
+  if (length(species_specific_genes$all_high_specific) >= 15) {
+    cat("   分析所有高特异性基因功能...\n")
+    functional_results[["all_high_specific_go_bp"]] <- perform_go_enrichment_optimized(
+      species_specific_genes$all_high_specific, "All_High_Specific", "BP"
+    )
+  }
+  functional_results <- functional_results[!sapply(functional_results, is.null)]
+  cat("   功能分析完成:", length(functional_results), "个有效结果\n")
+  return(functional_results)
+}
+
+### 6.5 物种特异性分析报告生成函数（新流程优化版）
+generate_species_specific_analysis_report <- function(species_analysis_results) {
+  cat("\n=== 生成物种特异性分析报告 ===\n")
+  report_df <- data.frame(
+    Species = character(),
+    High_Specific_Genes = integer(),
+    Functional_Terms = integer(),
+    Specificity_Pattern = character(),
+    Biological_Interpretation = character(),
+    Evolutionary_Significance = character(),
+    stringsAsFactors = FALSE
+  )
+  specific_genes <- species_analysis_results$specific_genes
+  functional_analysis <- species_analysis_results$functional_analysis
+  if (length(specific_genes$species_B_high) > 0) {
+    species_B_terms <- if (!is.null(functional_analysis$species_B_go_bp)) {
+      nrow(as.data.frame(functional_analysis$species_B_go_bp))
+    } else { 0 }
+    report_df <- rbind(report_df, data.frame(
+      Species = "[Species_B]",
+      High_Specific_Genes = specific_genes$counts["Species_B"],
+      Functional_Terms = species_B_terms,
+      Specificity_Pattern = "行为正趋势 + 关键网络模块",
+      Biological_Interpretation = "可能涉及记忆增强、空间导航优化的神经机制",
+      Evolutionary_Significance = "高行为强度的适应性分子基础",
+      stringsAsFactors = FALSE
+    ))
+  }
+  if (length(specific_genes$species_A_high) > 0) {
+    species_A_terms <- if (!is.null(functional_analysis$species_A_go_bp)) {
+      nrow(as.data.frame(functional_analysis$species_A_go_bp))
+    } else { 0 }
+    report_df <- rbind(report_df, data.frame(
+      Species = "[Species_A]", 
+      High_Specific_Genes = specific_genes$counts["Species_A"],
+      Functional_Terms = species_A_terms,
+      Specificity_Pattern = "基础代谢维持 + 一般神经功能",
+      Biological_Interpretation = "可能反映基础生物学特征",
+      Evolutionary_Significance = "非目标性状物种的分子特征",
+      stringsAsFactors = FALSE
+    ))
+  }
+  if (length(specific_genes$species_C_high) > 0) {
+    species_C_terms <- if (!is.null(functional_analysis$species_C_go_bp)) {
+      nrow(as.data.frame(functional_analysis$species_C_go_bp))
+    } else { 0 }
+    report_df <- rbind(report_df, data.frame(
+      Species = "[Species_C]",
+      High_Specific_Genes = specific_genes$counts["Species_C"],
+      Functional_Terms = species_C_terms,
+      Specificity_Pattern = "特殊行为适应 + 生态位特化",
+      Biological_Interpretation = "可能涉及特殊行为策略的行为调控机制", 
+      Evolutionary_Significance = "特殊行为的独特分子适应",
+      stringsAsFactors = FALSE
+    ))
+  }
+  write.csv(report_df, "New_Pipeline_Species_Specific_Analysis_Report.csv", row.names = FALSE)
+  cat("✅ 物种特异性分析报告已保存\n")
+  write.csv(species_analysis_results$specificity_scores, 
+            "New_Pipeline_Species_Specificity_Scores.csv", row.names = FALSE)
+  cat("\n=== 物种特异性分析报告摘要 ===\n")
+  cat("总分析物种:", nrow(report_df), "\n")
+  cat("总高特异性基因:", specific_genes$counts["Total"], "\n")
+  for (i in 1:nrow(report_df)) {
+    cat("  • ", report_df$Species[i], ": ", report_df$High_Specific_Genes[i], 
+        " 个基因, ", report_df$Functional_Terms[i], " 个功能条目\n", sep="")
+  }
+  return(report_df)
+}
+
+### 6.6 新流程物种特异性分析主执行函数
+execute_new_pipeline_species_specific_analysis <- function(prepared_data) {
+  cat("###############################################################################\n")
+  cat("# 第六章：新流程物种特异性基因分析 - 开始执行\n")
+  cat("###############################################################################\n")
+  cat("步骤0: 输入数据验证\n")
+  if (is.null(prepared_data) || is.null(prepared_data$all_gene_lists)) {
+    cat("❌ 错误: 未找到基因列表数据\n")
+    return(NULL)
+  }
+  gene_lists <- prepared_data$all_gene_lists
+  cat("✅ 输入数据验证通过\n")
+  cat("   待分析基因列表数量:", length(gene_lists), "\n")
+  cat("   包含分析方法: 趋势分析 + WGCNA网络分析\n")
+  cat("\n步骤1: 执行新流程物种特异性基因识别\n")
+  species_analysis_results <- analyze_new_pipeline_species_specific_genes(gene_lists)
+  if (is.null(species_analysis_results)) {
+    cat("❌ 物种特异性分析失败\n")
+    return(NULL)
+  }
+  cat("\n步骤2: 生成物种特异性分析报告\n")
+  analysis_report <- generate_species_specific_analysis_report(species_analysis_results)
+  cat("\n步骤3: 保存完整分析结果\n")
+  complete_species_analysis <- list(
+    species_analysis_results = species_analysis_results,
+    analysis_report = analysis_report,
+    gene_lists = gene_lists,
+    analysis_timestamp = Sys.time(),
+    pipeline_version = "DESeq2-Trend-WGCNA-SpeciesSpecific-Complete"
+  )
+  saveRDS(complete_species_analysis, "New_Pipeline_Complete_Species_Specific_Analysis.rds")
+  cat("✅ 完整物种特异性分析结果已保存\n")
+  cat("✅ 第六章：新流程物种特异性基因分析 - 完成！\n")
+  cat("🎯 物种特异性分析主要成果:\n")
+  cat("• 高特异性基因总数:", species_analysis_results$specific_genes$counts["Total"], "\n")
+  cat("• [Species_B]特异性基因:", species_analysis_results$specific_genes$counts["Species_B"], "\n")
+  cat("• [Species_A]特异性基因:", species_analysis_results$specific_genes$counts["Species_A"], "\n")
+  cat("• [Species_C]特异性基因:", species_analysis_results$specific_genes$counts["Species_C"], "\n")
+  cat("• 功能分析结果:", length(species_analysis_results$functional_analysis), "个\n")
+  cat("\n🔬 进化生物学意义:\n")
+  cat("• [Species_B] → 目标行为适应的分子特征\n")
+  cat("• [Species_A] → 非目标性状的基础特征\n") 
+  cat("• [Species_C] → 特殊行为策略的独特适应\n")
+  cat("• 跨物种比较 → 行为进化的遗传基础\n")
+  cat("\n📁 生成的核心文件:\n")
+  cat("• New_Pipeline_Species_Specific_Analysis_Report.csv\n")
+  cat("• New_Pipeline_Species_Specificity_Scores.csv\n")
+  cat("• New_Pipeline_Complete_Species_Specific_Analysis.rds\n")
+  cat("\n➡️  下一步建议:\n")
+  cat("1. 结合KEGG和GO分析进行功能整合\n")
+  cat("2. 进行物种比较进化分析\n")
+  cat("3. 基于特异性基因设计物种比较实验\n")
+  cat("4. 准备跨物种比较的图表和结果展示\n")
+  return(complete_species_analysis)
+}
+
+if (exists("prepared_data") && !is.null(prepared_data)) {
+  cat("🔍 检测到前期数据准备完成，自动执行物种特异性分析...\n")
+  species_specific_results <- execute_new_pipeline_species_specific_analysis(prepared_data)
+} else {
+  cat("💡 第六章物种特异性分析模块加载完成！\n")
+  cat("📋 使用方法:\n")
+  cat("   1. 确保已运行第一章并获得prepared_data对象\n")
+  cat("   2. 执行: species_specific_results <- execute_new_pipeline_species_specific_analysis(prepared_data)\n")
+  cat("   3. 查看物种特异性分析报告和基因列表\n\n")
+}
+cat("# 第六章代码加载完成 - 新流程物种特异性分析模块就绪\n")
