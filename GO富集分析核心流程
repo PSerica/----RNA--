@@ -1,0 +1,307 @@
+###############################################################################
+# 第二章：GO富集分析模块（新流程优化版）
+# 基于DESeq2→趋势分析→WGCNA流程的基因集合
+# 重点关注：行为相关趋势基因 + 网络关键模块
+###############################################################################
+
+### 2.1 GO富集分析核心函数（新流程优化版）
+perform_go_enrichment_optimized <- function(gene_list, list_name, ontology = "BP") {
+  cat("┌─ 开始GO分析: ", list_name, " - ", ontology, "\n", sep = "")
+  cat("│ 📊 输入验证和质量控制...\n")
+  if (is.null(gene_list) || length(gene_list) == 0) {
+    cat("│ ❌ 基因列表为空，跳过分析\n")
+    return(NULL)
+  }
+  gene_count <- length(gene_list)
+  if (gene_count < 5) {
+    cat("│ ⚠️  基因数量不足(", gene_count, ")，富集分析可能缺乏统计效力\n", sep = "")
+    return(NULL)
+  } else if (gene_count < 10) {
+    cat("│ ⚠️  基因数量较少(", gene_count, ")，结果需谨慎解释\n", sep = "")
+  } else {
+    cat("│ ✅ 基因数量合适:", gene_count, "个基因\n")
+  }
+  cat("│ 🔍 执行GO富集分析...\n")
+  tryCatch({
+    ego <- enrichGO(
+      gene          = gene_list,
+      OrgDb         = org.[YourSpecies].eg.db,
+      keyType       = "GID",
+      ont           = ontology,
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.2,
+      readable      = FALSE,
+      minGSSize     = 10,
+      maxGSSize     = 500
+    )
+    cat("│ 📈 分析结果验证和处理...\n")
+    if (!is.null(ego) && nrow(ego) > 0) {
+      result_df <- as.data.frame(ego)
+      result_df$GeneList_Name <- list_name
+      result_df$Ontology_Type <- ontology
+      result_df$Input_Gene_Count <- gene_count
+      result_df$Significant_Term_Count <- nrow(result_df)
+      result_df$Analysis_Timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      biological_meaning <- switch(list_name,
+                                   "trend_positive" = "表达随行为增强而上升",
+                                   "trend_negative" = "表达随行为增强而下降",
+                                   "wgcna_key_module" = "行为相关共表达模块",
+                                   "wgcna_hub_genes" = "共表达网络枢纽基因",
+                                   "high_confidence_overlap" = "趋势与WGCNA重叠高置信度基因",
+                                   "all_trend_genes" = "所有趋势分析基因",
+                                   "all_wgcna_genes" = "所有WGCNA分析基因",
+                                   "complete_gene_set" = "完整分析基因集合",
+                                   "其他基因集合"
+      )
+      result_df$Biological_Context <- biological_meaning
+      output_file <- paste0("GO_", ontology, "_", list_name, ".csv")
+      write.csv(result_df, output_file, row.names = FALSE)
+      cat("│ ✅ 分析成功! 发现", nrow(result_df), "个显著GO terms\n")
+      cat("│ 💾 结果文件:", output_file, "\n")
+      if (nrow(result_df) >= 3) {
+        cat("│ 🏆 前3个显著GO terms:\n")
+        for (i in 1:3) {
+          cat("│    ", i, ". ", result_df$Description[i], 
+              " (p.adj=", format(result_df$p.adjust[i], scientific = TRUE, digits = 2), ")\n", sep = "")
+        }
+      }
+      return(ego)
+    } else {
+      cat("│ ❌ 未发现显著富集的GO terms\n")
+      return(NULL)
+    }
+  }, error = function(e) {
+    cat("│ ❌ GO分析过程出错:\n")
+    cat("│    错误信息:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+### 2.2 智能批量GO分析执行器
+execute_intelligent_batch_go_analysis <- function(gene_lists) {
+  cat("\n=== 开始智能批量GO分析 ===\n")
+  go_results <- list()
+  analysis_plan <- list()
+  cat("步骤1: 制定分析优先级计划\n")
+  priority_order <- c(
+    "high_confidence_overlap",
+    "trend_positive", "trend_negative",
+    "wgcna_key_module", "wgcna_hub_genes",
+    "all_trend_genes", "all_wgcna_genes",
+    "complete_gene_set"
+  )
+  existing_lists <- intersect(priority_order, names(gene_lists))
+  additional_lists <- setdiff(names(gene_lists), priority_order)
+  sorted_lists <- c(existing_lists, additional_lists)
+  cat("│ 分析优先级排序:\n")
+  for (i in seq_along(sorted_lists)) {
+    list_name <- sorted_lists[i]
+    gene_count <- length(gene_lists[[list_name]])
+    status <- ifelse(gene_count >= 10, "✅", ifelse(gene_count >= 5, "⚠️", "❌"))
+    cat("│   ", i, ". ", status, " ", list_name, " (", gene_count, " genes)\n", sep = "")
+  }
+  cat("\n步骤2: 分本体执行批量分析\n")
+  ontologies <- c("BP", "MF", "CC")
+  total_planned <- length(sorted_lists) * length(ontologies)
+  completed_analyses <- 0
+  for (list_name in sorted_lists) {
+    current_genes <- gene_lists[[list_name]]
+    if (length(current_genes) < 5) {
+      cat("┌─ 跳过分析: ", list_name, " (基因数不足: ", length(current_genes), ")\n", sep = "")
+      completed_analyses <- completed_analyses + 3
+      next
+    }
+    cat("┌─ 分析基因列表: ", list_name, "\n", sep = "")
+    cat("│   基因数量: ", length(current_genes), "\n", sep = "")
+    for (ontology in ontologies) {
+      result_id <- paste0(list_name, "_", ontology)
+      go_result <- perform_go_enrichment_optimized(
+        gene_list = current_genes,
+        list_name = list_name,
+        ontology = ontology
+      )
+      if (!is.null(go_result)) {
+        go_results[[result_id]] <- go_result
+        analysis_plan[[result_id]] <- list(
+          status = "success",
+          gene_count = length(current_genes),
+          term_count = nrow(as.data.frame(go_result))
+        )
+      } else {
+        analysis_plan[[result_id]] <- list(
+          status = "failed",
+          gene_count = length(current_genes),
+          term_count = 0
+        )
+      }
+      completed_analyses <- completed_analyses + 1
+    }
+    cat("└─ 完成 ", list_name, " 的GO分析\n\n", sep = "")
+  }
+  cat("步骤3: 批量分析结果统计\n")
+  successful_analyses <- sum(sapply(analysis_plan, function(x) x$status == "success"))
+  failed_analyses <- total_planned - completed_analyses + 
+    sum(sapply(analysis_plan, function(x) x$status == "failed"))
+  cat("│ 计划分析任务: ", total_planned, "\n", sep = "")
+  cat("│ 成功完成分析: ", successful_analyses, "\n", sep = "")
+  cat("│ 分析失败/跳过: ", failed_analyses, "\n", sep = "")
+  cat("│ 总体成功率: ", round(successful_analyses/total_planned * 100, 1), "%\n", sep = "")
+  bp_success <- sum(grepl("_BP", names(go_results)))
+  mf_success <- sum(grepl("_MF", names(go_results)))
+  cc_success <- sum(grepl("_CC", names(go_results)))
+  cat("│ 按本体成功分析:\n")
+  cat("│   BP: ", bp_success, " | MF: ", mf_success, " | CC: ", cc_success, "\n", sep = "")
+  if (successful_analyses > 0) {
+    cat("✅ 批量GO分析完成，获得", successful_analyses, "个有效结果\n")
+  } else {
+    cat("❌ 批量GO分析未获得有效结果，请检查输入数据\n")
+  }
+  return(go_results)
+}
+
+### 2.3 新流程GO分析汇总报告生成器
+generate_new_pipeline_go_summary <- function(go_results, gene_lists) {
+  cat("\n=== 生成新流程GO分析汇总报告 ===\n")
+  summary_df <- data.frame(
+    Analysis_ID = character(),
+    GeneList_Name = character(),
+    Ontology_Type = character(),
+    Biological_Context = character(),
+    Input_Gene_Count = integer(),
+    Significant_Term_Count = integer(),
+    Most_Significant_Term = character(),
+    Most_Significant_PValue = numeric(),
+    GeneRatio = character(),
+    BgRatio = character(),
+    Output_File = character(),
+    stringsAsFactors = FALSE
+  )
+  cat("步骤1: 处理", length(go_results), "个GO分析结果\n")
+  for (result_id in names(go_results)) {
+    go_obj <- go_results[[result_id]]
+    id_parts <- strsplit(result_id, "_")[[1]]
+    ontology <- id_parts[length(id_parts)]
+    list_name <- paste(id_parts[1:(length(id_parts)-1)], collapse = "_")
+    result_data <- as.data.frame(go_obj)
+    if (nrow(result_data) > 0) {
+      top_term <- result_data$Description[1]
+      top_pvalue <- result_data$p.adjust[1]
+      gene_ratio <- result_data$GeneRatio[1]
+      bg_ratio <- result_data$BgRatio[1]
+      term_count <- nrow(result_data)
+    } else {
+      top_term <- "No_Significant_Terms"
+      top_pvalue <- NA
+      gene_ratio <- "0/0"
+      bg_ratio <- "0/0"
+      term_count <- 0
+    }
+    input_count <- length(gene_lists[[list_name]])
+    biological_context <- switch(list_name,
+                                 "trend_positive" = "行为正相关基因",
+                                 "trend_negative" = "行为负相关基因", 
+                                 "wgcna_key_module" = "行为相关共表达模块",
+                                 "wgcna_hub_genes" = "网络枢纽调控基因",
+                                 "high_confidence_overlap" = "高置信度重叠基因",
+                                 "all_trend_genes" = "所有趋势相关基因",
+                                 "all_wgcna_genes" = "所有网络相关基因",
+                                 "complete_gene_set" = "完整分析基因集合",
+                                 "其他基因集合"
+    )
+    output_file <- paste0("GO_", ontology, "_", list_name, ".csv")
+    summary_df <- rbind(summary_df, data.frame(
+      Analysis_ID = result_id,
+      GeneList_Name = list_name,
+      Ontology_Type = ontology,
+      Biological_Context = biological_context,
+      Input_Gene_Count = input_count,
+      Significant_Term_Count = term_count,
+      Most_Significant_Term = top_term,
+      Most_Significant_PValue = top_pvalue,
+      GeneRatio = gene_ratio,
+      BgRatio = bg_ratio,
+      Output_File = output_file,
+      stringsAsFactors = FALSE
+    ))
+  }
+  write.csv(summary_df, "New_Pipeline_GO_Analysis_Summary.csv", row.names = FALSE)
+  cat("✅ 新流程GO分析汇总报告已保存\n")
+  cat("\n步骤2: 生成统计分析摘要\n")
+  total_analyses <- nrow(summary_df)
+  successful_analyses <- sum(summary_df$Significant_Term_Count > 0)
+  success_rate <- round(successful_analyses / total_analyses * 100, 1)
+  cat("│ 总分析数量: ", total_analyses, "\n", sep = "")
+  cat("│ 成功分析数量: ", successful_analyses, " (", success_rate, "%)\n", sep = "")
+  ontology_stats <- table(summary_df$Ontology_Type)
+  cat("│ 按GO本体统计:\n")
+  for (ont in names(ontology_stats)) {
+    success_count <- sum(summary_df$Significant_Term_Count[summary_df$Ontology_Type == ont] > 0)
+    cat("│   ", ont, ": ", ontology_stats[ont], " analyses (", success_count, " success)\n", sep = "")
+  }
+  if (successful_analyses > 0) {
+    rich_analyses <- summary_df[summary_df$Significant_Term_Count > 0, ]
+    richest <- rich_analyses[which.max(rich_analyses$Significant_Term_Count), ]
+    cat("│ 🏆 最丰富的分析:\n")
+    cat("│   分析ID: ", richest$Analysis_ID, "\n", sep = "")
+    cat("│   显著Terms: ", richest$Significant_Term_Count, "\n", sep = "")
+    cat("│   最显著Term: ", richest$Most_Significant_Term, "\n", sep = "")
+  }
+  cat("✅ 新流程GO分析汇总完成\n")
+  return(summary_df)
+}
+
+### 2.4 新流程完整GO分析执行器
+execute_new_pipeline_go_analysis <- function(prepared_data) {
+  cat("###############################################################################\n")
+  cat("# 第二章：新流程GO富集分析 - 开始执行\n")
+  cat("###############################################################################\n")
+  cat("步骤0: 输入数据验证\n")
+  if (is.null(prepared_data) || is.null(prepared_data$all_gene_lists)) {
+    cat("❌ 错误: 未找到基因列表数据\n")
+    return(NULL)
+  }
+  gene_lists <- prepared_data$all_gene_lists
+  cat("✅ 输入数据验证通过\n")
+  cat("   基因列表数量: ", length(gene_lists), "\n", sep = "")
+  cat("   总基因数: ", length(unique(unlist(gene_lists))), "\n", sep = "")
+  cat("\n步骤1: 执行智能批量GO分析\n")
+  go_results <- execute_intelligent_batch_go_analysis(gene_lists)
+  if (length(go_results) == 0) {
+    cat("❌ 错误: 没有成功的GO分析结果\n")
+    return(NULL)
+  }
+  cat("\n步骤2: 生成新流程专用汇总报告\n")
+  summary_report <- generate_new_pipeline_go_summary(go_results, gene_lists)
+  cat("\n步骤3: 保存完整分析结果\n")
+  complete_results <- list(
+    go_results = go_results,
+    summary_report = summary_report,
+    gene_lists = gene_lists,
+    analysis_timestamp = Sys.time(),
+    pipeline_version = "DESeq2-Trend-WGCNA-GO"
+  )
+  saveRDS(complete_results, "New_Pipeline_Complete_GO_Results.rds")
+  cat("✅ 完整GO分析结果已保存\n")
+  cat("✅ 第二章：新流程GO富集分析 - 完成！\n")
+  cat("🎯 主要分析成果:\n")
+  cat("• 成功分析数量: ", length(go_results), "\n", sep = "")
+  cat("• 结果文件: GO_*_*.csv\n")
+  cat("• 汇总报告: New_Pipeline_GO_Analysis_Summary.csv\n")
+  cat("• 完整结果: New_Pipeline_Complete_GO_Results.rds\n")
+  return(complete_results)
+}
+
+if (exists("prepared_data") && !is.null(prepared_data)) {
+  cat("🔍 检测到第一章数据准备完成，自动执行GO分析...\n")
+  go_analysis_results <- execute_new_pipeline_go_analysis(prepared_data)
+} else {
+  cat("💡 第二章GO分析模块加载完成！\n")
+  cat("📋 使用方法:\n")
+  cat("   1. 确保已运行第一章并获得prepared_data对象\n")
+  cat("   2. 执行: go_analysis_results <- execute_new_pipeline_go_analysis(prepared_data)\n")
+  cat("   3. 查看结果文件和分析报告\n\n")
+}
+cat("###############################################################################\n")
+cat("# 第二章代码加载完成 - 新流程GO富集分析模块就绪\n")
+cat("###############################################################################\n")
