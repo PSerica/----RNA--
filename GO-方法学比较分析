@@ -1,0 +1,350 @@
+###############################################################################
+# 第三章：方法学比较分析模块（新流程优化版）
+# 基于DESeq2→趋势分析→WGCNA流程的多方法比较
+# 重点：比较不同分析方法发现的功能模式异同
+###############################################################################
+
+### 3.1 准备方法学比较数据（新流程适配版）
+prepare_method_comparison_data <- function(gene_lists) {
+  cat("\n=== 准备方法学比较分析数据 ===\n")
+  method_comparison_list <- list()
+  cat("步骤1: 组织趋势分析相关基因集合\n")
+  trend_genes <- list()
+  if (!is.null(gene_lists$trend_positive) && length(gene_lists$trend_positive) > 0) {
+    trend_genes[["Trend_Positive"]] <- gene_lists$trend_positive
+    cat("│ ✅ 正趋势基因: ", length(gene_lists$trend_positive), "个基因\n", sep = "")
+  }
+  if (!is.null(gene_lists$trend_negative) && length(gene_lists$trend_negative) > 0) {
+    trend_genes[["Trend_Negative"]] <- gene_lists$trend_negative
+    cat("│ ✅ 负趋势基因: ", length(gene_lists$trend_negative), "个基因\n", sep = "")
+  }
+  if (!is.null(gene_lists$all_trend_genes) && length(gene_lists$all_trend_genes) > 0) {
+    trend_genes[["All_Trend_Genes"]] <- gene_lists$all_trend_genes
+    cat("│ ✅ 所有趋势基因: ", length(gene_lists$all_trend_genes), "个基因\n", sep = "")
+  }
+  if (length(trend_genes) > 0) {
+    method_comparison_list[["Trend_Analysis"]] <- trend_genes
+  }
+  cat("步骤2: 组织WGCNA分析相关基因集合\n")
+  wgcna_genes <- list()
+  if (!is.null(gene_lists$wgcna_key_module) && length(gene_lists$wgcna_key_module) > 0) {
+    wgcna_genes[["WGCNA_Key_Module"]] <- gene_lists$wgcna_key_module
+    cat("│ ✅ 关键模块基因: ", length(gene_lists$wgcna_key_module), "个基因\n", sep = "")
+  }
+  if (!is.null(gene_lists$wgcna_hub_genes) && length(gene_lists$wgcna_hub_genes) > 0) {
+    wgcna_genes[["WGCNA_Hub_Genes"]] <- gene_lists$wgcna_hub_genes
+    cat("│ ✅ 枢纽基因: ", length(gene_lists$wgcna_hub_genes), "个基因\n", sep = "")
+  }
+  if (!is.null(gene_lists$all_wgcna_genes) && length(gene_lists$all_wgcna_genes) > 0) {
+    wgcna_genes[["All_WGCNA_Genes"]] <- gene_lists$all_wgcna_genes
+    cat("│ ✅ 所有WGCNA基因: ", length(gene_lists$all_wgcna_genes), "个基因\n", sep = "")
+  }
+  if (length(wgcna_genes) > 0) {
+    method_comparison_list[["WGCNA_Analysis"]] <- wgcna_genes
+  }
+  cat("步骤3: 组织高置信度整合基因集合\n")
+  confidence_genes <- list()
+  if (!is.null(gene_lists$high_confidence_overlap) && length(gene_lists$high_confidence_overlap) > 0) {
+    confidence_genes[["High_Confidence_Overlap"]] <- gene_lists$high_confidence_overlap
+    cat("│ ✅ 高置信度重叠基因: ", length(gene_lists$high_confidence_overlap), "个基因\n", sep = "")
+  }
+  if (!is.null(gene_lists$complete_gene_set) && length(gene_lists$complete_gene_set) > 0) {
+    confidence_genes[["Complete_Gene_Set"]] <- gene_lists$complete_gene_set
+    cat("│ ✅ 完整基因集合: ", length(gene_lists$complete_gene_set), "个基因\n", sep = "")
+  }
+  if (length(confidence_genes) > 0) {
+    method_comparison_list[["Confidence_Levels"]] <- confidence_genes
+  }
+  cat("步骤4: 数据质量检查和统计\n")
+  total_groups <- length(method_comparison_list)
+  total_subgroups <- sum(sapply(method_comparison_list, length))
+  cat("│ 总分析方法组: ", total_groups, "\n", sep = "")
+  cat("│ 总基因子集: ", total_subgroups, "\n", sep = "")
+  for (method_name in names(method_comparison_list)) {
+    subgroups <- method_comparison_list[[method_name]]
+    cat("│   ", method_name, ":\n", sep = "")
+    for (sub_name in names(subgroups)) {
+      gene_count <- length(subgroups[[sub_name]])
+      status <- ifelse(gene_count >= 10, "✅", ifelse(gene_count >= 5, "⚠️", "❌"))
+      cat("│     ", status, " ", sub_name, ": ", gene_count, " genes\n", sep = "")
+    }
+  }
+  valid_comparison_list <- list()
+  for (method_name in names(method_comparison_list)) {
+    subgroups <- method_comparison_list[[method_name]]
+    valid_subgroups <- subgroups[sapply(subgroups, length) >= 5]
+    if (length(valid_subgroups) >= 2) {
+      valid_comparison_list[[method_name]] <- valid_subgroups
+    }
+  }
+  cat("✅ 有效比较组数量: ", length(valid_comparison_list), "\n", sep = "")
+  if (length(valid_comparison_list) == 0) {
+    cat("❌ 没有足够的有效比较组，方法学比较分析无法进行\n")
+    return(NULL)
+  }
+  return(valid_comparison_list)
+}
+
+### 3.2 执行方法学比较GO分析（新流程优化版）
+perform_method_comparison_go_analysis <- function(comparison_list, ontology = "BP") {
+  cat("┌─ 执行方法学比较GO分析 (", ontology, ")\n", sep = "")
+  cat("│ 📊 输入数据验证...\n")
+  if (length(comparison_list) < 1) {
+    cat("│ ❌ 比较组数量不足\n")
+    return(NULL)
+  }
+  flat_comparison_list <- list()
+  for (method_name in names(comparison_list)) {
+    subgroups <- comparison_list[[method_name]]
+    for (sub_name in names(subgroups)) {
+      full_name <- paste0(method_name, "_", sub_name)
+      flat_comparison_list[[full_name]] <- subgroups[[sub_name]]
+    }
+  }
+  gene_counts <- sapply(flat_comparison_list, length)
+  cat("│ 各比较组基因数量:\n")
+  for (group_name in names(gene_counts)) {
+    count <- gene_counts[group_name]
+    status <- ifelse(count >= 10, "✅", ifelse(count >= 5, "⚠️", "❌"))
+    cat("│   ", status, " ", group_name, ": ", count, " genes\n", sep = "")
+  }
+  cat("│ 🔍 执行compareCluster分析...\n")
+  tryCatch({
+    comparison_go <- compareCluster(
+      geneClusters   = flat_comparison_list,
+      fun           = "enrichGO",
+      OrgDb         = org.[YourSpecies].eg.db,
+      keyType       = "GID",
+      ont           = ontology,
+      pAdjustMethod = "BH",
+      pvalueCutoff  = 0.05,
+      qvalueCutoff  = 0.2,
+      minGSSize     = 10,
+      maxGSSize     = 500,
+      readable      = FALSE
+    )
+    cat("│ 📈 分析结果验证和处理...\n")
+    if (!is.null(comparison_go) && nrow(comparison_go@compareClusterResult) > 0) {
+      result_df <- as.data.frame(comparison_go)
+      result_df$Analysis_Type <- "Method_Comparison"
+      result_df$Ontology_Type <- ontology
+      result_df$Comparison_Group_Count <- length(flat_comparison_list)
+      result_df$Analysis_Timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      output_file <- paste0("GO_Method_Comparison_", ontology, ".csv")
+      write.csv(result_df, output_file, row.names = FALSE)
+      unique_clusters <- length(unique(result_df$Cluster))
+      total_terms <- nrow(result_df)
+      cat("│ ✅ 比较分析成功!\n")
+      cat("│    比较组数量: ", unique_clusters, "\n", sep = "")
+      cat("│    显著GO terms: ", total_terms, "\n", sep = "")
+      cat("│    结果文件: ", output_file, "\n", sep = "")
+      cluster_stats <- table(result_df$Cluster)
+      cat("│    各比较组显著terms:\n")
+      for (cluster_name in names(cluster_stats)) {
+        cat("│      - ", cluster_name, ": ", cluster_stats[cluster_name], " terms\n", sep = "")
+      }
+      return(comparison_go)
+    } else {
+      cat("│ ❌ 未发现显著富集的GO terms\n")
+      return(NULL)
+    }
+  }, error = function(e) {
+    cat("│ ❌ 方法学比较分析出错:\n")
+    cat("│    错误信息: ", e$message, "\n", sep = "")
+    return(NULL)
+  })
+}
+
+### 3.3 执行完整的方法学比较分析流程
+execute_complete_method_comparison <- function(gene_lists) {
+  cat("第三章：方法学比较分析 - 开始执行\n")
+  cat("步骤1: 准备方法学比较数据\n")
+  method_comparison_data <- prepare_method_comparison_data(gene_lists)
+  if (is.null(method_comparison_data)) {
+    cat("❌ 方法学比较数据准备失败，无法继续分析\n")
+    return(NULL)
+  }
+  cat("\n步骤2: 执行多本体比较分析\n")
+  comparison_results <- list()
+  ontologies <- c("BP", "MF", "CC")
+  for (ontology in ontologies) {
+    cat("┌─ 执行 ", ontology, " 本体比较分析\n", sep = "")
+    ontology_results <- list()
+    for (method_group in names(method_comparison_data)) {
+      subgroup_data <- list(method_comparison_data[[method_group]])
+      names(subgroup_data) <- method_group
+      group_result <- perform_method_comparison_go_analysis(
+        comparison_list = subgroup_data,
+        ontology = ontology
+      )
+      if (!is.null(group_result)) {
+        result_id <- paste0(method_group, "_", ontology)
+        ontology_results[[result_id]] <- group_result
+      }
+    }
+    overall_result <- perform_method_comparison_go_analysis(
+      comparison_list = method_comparison_data,
+      ontology = ontology
+    )
+    if (!is.null(overall_result)) {
+      result_id <- paste0("Overall_", ontology)
+      ontology_results[[result_id]] <- overall_result
+    }
+    comparison_results <- c(comparison_results, ontology_results)
+    cat("└─ 完成 ", ontology, " 本体分析\n\n", sep = "")
+  }
+  cat("步骤3: 结果统计和保存\n")
+  if (length(comparison_results) > 0) {
+    saveRDS(comparison_results, "Method_Comparison_GO_Results.rds")
+    cat("✅ 方法学比较结果已保存\n")
+    total_comparisons <- length(comparison_results)
+    successful_ontologies <- unique(gsub(".*_", "", names(comparison_results)))
+    cat("│ 总比较分析数量: ", total_comparisons, "\n", sep = "")
+    cat("│ 成功分析的本体: ", paste(successful_ontologies, collapse = ", "), "\n", sep = "")
+    method_groups <- unique(gsub("_.*", "", names(comparison_results)))
+    cat("│ 分析方法组: ", paste(method_groups, collapse = ", "), "\n", sep = "")
+  } else {
+    cat("❌ 未获得任何有效的比较分析结果\n")
+    return(NULL)
+  }
+  return(comparison_results)
+}
+
+### 3.4 生成方法学比较分析报告
+generate_method_comparison_report <- function(comparison_results, gene_lists) {
+  cat("\n=== 生成方法学比较分析报告 ===\n")
+  summary_df <- data.frame(
+    Analysis_ID = character(),
+    Comparison_Type = character(),
+    Ontology_Type = character(),
+    Cluster_Count = integer(),
+    Significant_Term_Count = integer(),
+    Most_Enriched_Term = character(),
+    Most_Enriched_Cluster = character(),
+    Most_Significant_PValue = numeric(),
+    Term_Diversity_Index = numeric(),
+    stringsAsFactors = FALSE
+  )
+  cat("步骤1: 处理", length(comparison_results), "个比较分析结果\n")
+  for (result_id in names(comparison_results)) {
+    comparison_obj <- comparison_results[[result_id]]
+    result_data <- as.data.frame(comparison_obj)
+    if (nrow(result_data) > 0) {
+      id_parts <- strsplit(result_id, "_")[[1]]
+      comparison_type <- id_parts[1]
+      ontology_type <- id_parts[2]
+      cluster_count <- length(unique(result_data$Cluster))
+      term_count <- nrow(result_data)
+      most_enriched <- result_data[which.min(result_data$p.adjust), ]
+      top_term <- most_enriched$Description
+      top_cluster <- most_enriched$Cluster
+      top_pvalue <- most_enriched$p.adjust
+      term_diversity <- length(unique(result_data$Description)) / term_count
+      summary_df <- rbind(summary_df, data.frame(
+        Analysis_ID = result_id,
+        Comparison_Type = comparison_type,
+        Ontology_Type = ontology_type,
+        Cluster_Count = cluster_count,
+        Significant_Term_Count = term_count,
+        Most_Enriched_Term = top_term,
+        Most_Enriched_Cluster = top_cluster,
+        Most_Significant_PValue = top_pvalue,
+        Term_Diversity_Index = round(term_diversity, 3),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  if (nrow(summary_df) > 0) {
+    write.csv(summary_df, "Method_Comparison_Analysis_Summary.csv", row.names = FALSE)
+    cat("✅ 方法学比较汇总报告已保存\n")
+  }
+  cat("\n步骤2: 生成比较分析洞察\n")
+  if (nrow(summary_df) > 0) {
+    total_comparisons <- nrow(summary_df)
+    avg_terms_per_comparison <- mean(summary_df$Significant_Term_Count)
+    cat("│ 总比较分析: ", total_comparisons, "\n", sep = "")
+    cat("│ 平均显著terms/分析: ", round(avg_terms_per_comparison, 1), "\n", sep = "")
+    comparison_stats <- table(summary_df$Comparison_Type)
+    cat("│ 按比较类型统计:\n")
+    for (comp_type in names(comparison_stats)) {
+      comp_data <- summary_df[summary_df$Comparison_Type == comp_type, ]
+      avg_terms <- mean(comp_data$Significant_Term_Count)
+      cat("│   ", comp_type, ": ", nrow(comp_data), " analyses, ", 
+          round(avg_terms, 1), " avg terms\n", sep = "")
+    }
+    richest_comparison <- summary_df[which.max(summary_df$Significant_Term_Count), ]
+    cat("│ 🏆 最丰富的比较分析:\n")
+    cat("│   分析ID: ", richest_comparison$Analysis_ID, "\n", sep = "")
+    cat("│   显著terms: ", richest_comparison$Significant_Term_Count, "\n", sep = "")
+    cat("│   最显著term: ", richest_comparison$Most_Enriched_Term, "\n", sep = "")
+    if ("Overall" %in% summary_df$Comparison_Type) {
+      overall_analyses <- summary_df[summary_df$Comparison_Type == "Overall", ]
+      avg_diversity <- mean(overall_analyses$Term_Diversity_Index, na.rm = TRUE)
+      cat("│ 🔍 方法学一致性评估:\n")
+      cat("│   平均Term多样性指数: ", round(avg_diversity, 3), "\n", sep = "")
+      if (avg_diversity > 0.7) {
+        cat("│   解读: 不同方法发现的功能高度一致\n")
+      } else if (avg_diversity > 0.4) {
+        cat("│   解读: 不同方法发现的功能中等一致\n")
+      } else {
+        cat("│   解读: 不同方法发现的功能差异较大\n")
+      }
+    }
+  }
+  cat("✅ 方法学比较分析报告生成完成\n")
+  return(summary_df)
+}
+
+### 3.5 新流程方法学比较主执行函数
+execute_new_pipeline_method_comparison <- function(prepared_data) {
+  cat("###############################################################################\n")
+  cat("# 第三章：方法学比较分析 - 开始执行\n")
+  cat("###############################################################################\n")
+  cat("步骤0: 输入数据验证\n")
+  if (is.null(prepared_data) || is.null(prepared_data$all_gene_lists)) {
+    cat("❌ 错误: 未找到基因列表数据\n")
+    return(NULL)
+  }
+  gene_lists <- prepared_data$all_gene_lists
+  cat("✅ 输入数据验证通过\n")
+  cat("   待比较基因列表数量: ", length(gene_lists), "\n", sep = "")
+  cat("\n步骤1: 执行方法学比较分析\n")
+  comparison_results <- execute_complete_method_comparison(gene_lists)
+  if (is.null(comparison_results) || length(comparison_results) == 0) {
+    cat("❌ 方法学比较分析未获得有效结果\n")
+    return(NULL)
+  }
+  cat("\n步骤2: 生成方法学比较报告\n")
+  comparison_summary <- generate_method_comparison_report(comparison_results, gene_lists)
+  cat("\n步骤3: 保存完整分析结果\n")
+  complete_comparison_results <- list(
+    comparison_results = comparison_results,
+    comparison_summary = comparison_summary,
+    gene_lists = gene_lists,
+    analysis_timestamp = Sys.time(),
+    pipeline_version = "DESeq2-Trend-WGCNA-Comparison"
+  )
+  saveRDS(complete_comparison_results, "New_Pipeline_Method_Comparison_Results.rds")
+  cat("✅ 完整方法学比较结果已保存\n")
+  cat("✅ 第三章：方法学比较分析 - 完成！\n")
+  cat("🎯 方法学比较主要成果:\n")
+  cat("• 成功比较分析数量: ", length(comparison_results), "\n", sep = "")
+  cat("• 比较结果文件: GO_Method_Comparison_*.csv\n")
+  cat("• 汇总报告: Method_Comparison_Analysis_Summary.csv\n")
+  cat("• 完整结果: New_Pipeline_Method_Comparison_Results.rds\n")
+  return(complete_comparison_results)
+}
+
+if (exists("prepared_data") && !is.null(prepared_data)) {
+  cat("🔍 检测到前期数据准备完成，自动执行方法学比较分析...\n")
+  method_comparison_results <- execute_new_pipeline_method_comparison(prepared_data)
+} else {
+  cat("💡 第三章方法学比较分析模块加载完成！\n")
+  cat("📋 使用方法:\n")
+  cat("   1. 确保已运行第一章并获得prepared_data对象\n")
+  cat("   2. 执行: comparison_results <- execute_new_pipeline_method_comparison(prepared_data)\n")
+  cat("   3. 查看比较分析结果和汇总报告\n\n")
+}
+cat("###############################################################################\n")
+cat("# 第三章代码加载完成 - 方法学比较分析模块就绪\n")
+cat("###############################################################################\n")
